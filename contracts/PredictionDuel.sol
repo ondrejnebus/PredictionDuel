@@ -106,6 +106,9 @@ contract PredictionDuel is ReentrancyGuard {
     uint256 public constant SLASH_AMOUNT   = 0.02 ether;
     uint256 public constant VOTING_PERIOD  = 48 hours;
     uint256 public constant APPEAL_WINDOW  = 24 hours;
+    /// @notice Grace period after resolutionDeadline before a DISPUTED duel
+    ///         that nobody escalated can be force-refunded by either party.
+    uint256 public constant ESCALATION_GRACE = 7 days;
     uint8   private constant MAX_ROUNDS    = 3;
 
     // ------
@@ -174,7 +177,6 @@ contract PredictionDuel is ReentrancyGuard {
     error NoDisputesInQueue();
     error NotEligibleJuror();
     error JurorIsParticipant();
-    error AlreadyJurorOnDispute();
     error DisputeNotInitialized();
     error VotingNotStarted();
     error VotingPeriodNotOver();
@@ -188,6 +190,7 @@ contract PredictionDuel is ReentrancyGuard {
     error MaxRoundsReached();
     error DuelNotDisputed();
     error DisputeAlreadyInitialized();
+    error EscalationGraceNotReached();
 
     // ------
     // Constructor
@@ -413,6 +416,21 @@ contract PredictionDuel is ReentrancyGuard {
         emit DisputeEscalated(duelId, 1, msg.sender);
     }
 
+    /// @notice Refund both stakes for a duel that has been DISPUTED for longer
+    ///         than `ESCALATION_GRACE` past `resolutionDeadline` without anyone
+    ///         escalating to a jury. Anyone can call this so a stuck duel
+    ///         never permanently locks funds.
+    function cancelStaleDispute(uint256 duelId) external nonReentrant {
+        Duel storage d = _duels[duelId];
+        if (d.creator == address(0)) revert DuelNotFound();
+        if (d.status != Status.DISPUTED) revert DuelNotDisputed();
+        if (_disputes[duelId].initialized) revert DisputeAlreadyInitialized();
+        if (block.timestamp < uint256(d.resolutionDeadline) + ESCALATION_GRACE) {
+            revert EscalationGraceNotReached();
+        }
+        _refundBoth(d, duelId);
+    }
+
     // ------
     // Phase-5: Jury panel assembly
     // ------
@@ -420,12 +438,10 @@ contract PredictionDuel is ReentrancyGuard {
     /// @notice Claim the front dispute from the FIFO queue.
     ///         Once the required panel size for the current round is reached,
     ///         the queue advances and the voting window opens.
+    /// @dev    No `selectedJurors` membership check is needed: a juror
+    ///         already on the panel has `lockedOnDispute != 0`, and that
+    ///         earlier branch reverts with `JurorAlreadyLocked` first.
     function claimDispute() external nonReentrant {
-        // Skip any finalized disputes that slipped through (safety net)
-        while (_queueHead < _disputeQueue.length
-               && _disputes[_disputeQueue[_queueHead]].finalized) {
-            unchecked { _queueHead++; }
-        }
         if (_queueHead >= _disputeQueue.length) revert NoDisputesInQueue();
 
         uint256 duelId  = _disputeQueue[_queueHead];
@@ -436,12 +452,6 @@ contract PredictionDuel is ReentrancyGuard {
         if (!j.isActive || j.stake < JUROR_STAKE) revert NotEligibleJuror();
         if (j.lockedOnDispute != 0) revert JurorAlreadyLocked();
         if (msg.sender == d.creator || msg.sender == d.opponent) revert JurorIsParticipant();
-
-        uint256 len = dd.selectedJurors.length;
-        for (uint256 i; i < len; ) {
-            if (dd.selectedJurors[i] == msg.sender) revert AlreadyJurorOnDispute();
-            unchecked { ++i; }
-        }
 
         j.lockedOnDispute = duelId;
         dd.selectedJurors.push(msg.sender);
@@ -726,9 +736,9 @@ contract PredictionDuel is ReentrancyGuard {
     }
 
     /// @dev Settle the underlying duel and distribute juror rewards.
-    ///      If verdict == INVALID, both stakes are refunded and no reputation
-    ///      is recorded. The fee pool remains locked in the contract (accepted
-    ///      dust for v1; a governance fee-sweep can be added later).
+    ///      If verdict == INVALID, both stakes are refunded **and the dispute
+    ///      fee pool is split 50/50 between the participants** so escalation
+    ///      fees aren't lost when the jury can't reach a clear answer.
     function _finalizeDispute(uint256 duelId, Outcome verdict) private {
         DisputeData storage dd = _disputes[duelId];
         Duel storage d         = _duels[duelId];
@@ -740,6 +750,14 @@ contract PredictionDuel is ReentrancyGuard {
             emit DuelRefunded(duelId, d.creatorStake, d.opponentStake);
             _credit(d.creator,  d.creatorStake);
             _credit(d.opponent, d.opponentStake);
+            // Refund the dispute fee pool 50/50 so escalators aren't punished
+            // for an inconclusive jury. Any odd-wei remainder favours the opponent.
+            uint256 pool = dd.feePool;
+            if (pool > 0) {
+                uint256 half = pool / 2;
+                _credit(d.creator,  half);
+                _credit(d.opponent, pool - half);
+            }
         } else {
             bool    creatorWins = (verdict == d.creatorOutcome);
             address winner      = creatorWins ? d.creator  : d.opponent;
@@ -757,7 +775,8 @@ contract PredictionDuel is ReentrancyGuard {
         }
 
         // Reward majority jurors of the final round from the fee pool.
-        // Fee pool is zero when verdict == INVALID (skipped to avoid wasted gas).
+        // INVALID verdicts return early above (fee pool is split 50/50 to
+        // participants there), so this branch only handles YES / NO.
         if (verdict != Outcome.INVALID && dd.feePool > 0) {
             uint256 panelLen = dd.selectedJurors.length;
             uint256 majorityCount;

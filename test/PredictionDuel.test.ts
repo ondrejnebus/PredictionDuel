@@ -1485,8 +1485,12 @@ describe("PredictionDuel", function () {
         .to.emit(contract, "DisputeFinalized").withArgs(1n, Outcome.INVALID)
         .and.to.emit(contract, "DuelRefunded").withArgs(1n, f.creatorStake, f.opponentStake);
 
-      expect(await contract.pendingWithdrawals(f.alice.address)).to.equal(f.creatorStake);
-      expect(await contract.pendingWithdrawals(f.bob.address)).to.equal(f.opponentStake);
+      // Fee pool on INVALID is split 50/50: 0.01 escalation + 2 × 0.02 minority slashes = 0.05 ETH.
+      // (j1 voted YES and j2 voted NO; j3 voted INVALID — only j3 matched the
+      // verdict, so j1 and j2 are minority and each lose SLASH_AMOUNT.)
+      const half = ethers.parseEther("0.025");
+      expect(await contract.pendingWithdrawals(f.alice.address)).to.equal(f.creatorStake + half);
+      expect(await contract.pendingWithdrawals(f.bob.address)).to.equal(f.opponentStake + half);
     });
 
     it("E15. appealDispute: NoAppealWindow / AppealWindowExpired branches", async function () {
@@ -1531,6 +1535,63 @@ describe("PredictionDuel", function () {
       const dd = await contract.getDisputeData(1);
       expect(dd.lastRoundOutcome).to.equal(Outcome.NO);
       expect(dd.round1Loser).to.equal(f.alice.address);
+    });
+
+    it("E17a. cancelStaleDispute: refunds both stakes after grace period without escalation", async function () {
+      const f = await loadFixture(deployFixture);
+      const { contract } = f;
+
+      await contract.connect(f.alice).createDuel(
+        QUESTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
+        f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
+      );
+      await contract.connect(f.bob).acceptDuel(1, { value: f.opponentStake });
+      await contract.connect(f.alice).submitVote(1, Outcome.YES);
+      await contract.connect(f.bob).submitVote(1, Outcome.NO);
+      await time.increaseTo(f.voteDeadline);
+      await contract.settleDuel(1); // -> DISPUTED, no escalation
+
+      // Before grace period elapses → revert.
+      await expect(contract.cancelStaleDispute(1))
+        .to.be.revertedWithCustomError(contract, "EscalationGraceNotReached");
+
+      // Advance past resolutionDeadline + 7 days.
+      await time.increaseTo(f.resolutionDeadline + 7 * 24 * 60 * 60 + 1);
+
+      await expect(contract.cancelStaleDispute(1))
+        .to.emit(contract, "DuelRefunded").withArgs(1n, f.creatorStake, f.opponentStake);
+
+      expect(await contract.pendingWithdrawals(f.alice.address)).to.equal(f.creatorStake);
+      expect(await contract.pendingWithdrawals(f.bob.address)).to.equal(f.opponentStake);
+      expect((await contract.getDuel(1)).status).to.equal(Status.SETTLED);
+    });
+
+    it("E17b. cancelStaleDispute: revert paths (not found, wrong status, already initialized)", async function () {
+      const f = await loadFixture(deployFixture);
+      const { contract } = f;
+
+      // Not found
+      await expect(contract.cancelStaleDispute(99))
+        .to.be.revertedWithCustomError(contract, "DuelNotFound");
+
+      // Wrong status (CREATED, never accepted/disputed)
+      await contract.connect(f.alice).createDuel(
+        QUESTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
+        f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
+      );
+      await expect(contract.cancelStaleDispute(1))
+        .to.be.revertedWithCustomError(contract, "DuelNotDisputed");
+
+      // After escalation: should revert with DisputeAlreadyInitialized
+      await contract.connect(f.bob).acceptDuel(1, { value: f.opponentStake });
+      await contract.connect(f.alice).submitVote(1, Outcome.YES);
+      await contract.connect(f.bob).submitVote(1, Outcome.NO);
+      await time.increaseTo(f.voteDeadline);
+      await contract.settleDuel(1);
+      await contract.connect(f.alice).escalateToJury(1, { value: ethers.parseEther("0.01") });
+      await time.increaseTo(f.resolutionDeadline + 7 * 24 * 60 * 60 + 1);
+      await expect(contract.cancelStaleDispute(1))
+        .to.be.revertedWithCustomError(contract, "DisputeAlreadyInitialized");
     });
 
     it("E17. View functions: getActiveDuels, getUserDuels, getDuelistReputation, getNextDispute (empty)", async function () {

@@ -1,0 +1,22 @@
+{
+  "network": "sepolia",
+  "chainId": 11155111,
+  "deployer": "0x5A684A789998B4Cf338c244073F996575BB5f66e",
+  "timestamp": "2026-05-07T18:05:52.636Z",
+  "contracts": {
+    "DuelReputation": {
+      "address": "0x8E351b767e54CE32dEbd6fBD7d456d50eAEcB595",
+      "constructorArgs": [
+        "0x34e27a22f82aCBBEA6672627B3C8c8AF006733C4"
+      ],
+      "deploymentTx": "0x7fcc422f8f30ff0df6eec8af7261ca942948a46154352dfd388cc9eeaecda92f"
+    },
+    "PredictionDuel": {
+      "address": "0x34e27a22f82aCBBEA6672627B3C8c8AF006733C4",
+      "constructorArgs": [
+        "0x8E351b767e54CE32dEbd6fBD7d456d50eAEcB595"
+      ],
+      "deploymentTx": "0x6c79f9858127bcfce534b1d7907db41d173a06ae89dd8691940744b26adcdae9"
+    }
+  }
+}
