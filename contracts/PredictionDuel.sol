@@ -2,6 +2,7 @@
 pragma solidity 0.8.35;
 
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {DuelReputation} from "./DuelReputation.sol";
 
 /// @title PredictionDuel
 /// @notice Trustless peer-to-peer wagers on a yes/no outcome with
@@ -11,20 +12,16 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 ///         to win less. The total pot is `creatorStake + opponentStake` and
 ///         is awarded to the side that the post-event consensus vote agrees
 ///         with.
-/// @dev    Phase 1: dispute resolution and reputation are intentionally out
-///         of scope. Funds are paid out via the **pull-payment** pattern -
-///         settlement only credits an internal balance and the recipient
-///         claims via `withdraw()` - so a receiver that rejects ETH cannot
-///         brick the duel for the counterparty.
+/// @dev    Funds are paid out via the **pull-payment** pattern - settlement
+///         only credits an internal balance and the recipient claims via
+///         `withdraw()` - so a receiver that rejects ETH cannot brick the
+///         duel for the counterparty. A linked `DuelReputation` SBT records
+///         on-chain reputation for every settled duel.
 contract PredictionDuel is ReentrancyGuard {
     // ------
     // Types
     // ------
 
-    /// @notice Possible bet sides and vote values.
-    /// @dev NONE is the unset default; YES/NO are the bettable sides;
-    ///      INVALID lets both sides agree the event was unresolvable so that
-    ///      stakes are refunded.
     enum Outcome {
         NONE,
         YES,
@@ -32,7 +29,6 @@ contract PredictionDuel is ReentrancyGuard {
         INVALID
     }
 
-    /// @notice Lifecycle of a duel.
     enum Status {
         CREATED,
         ACTIVE,
@@ -46,15 +42,16 @@ contract PredictionDuel is ReentrancyGuard {
         uint256 id;
         address creator;
         address opponent;
-        uint256 creatorStake;       // creator's locked ETH (paid at create)
-        uint256 opponentStake;      // ETH opponent must send at accept
-        uint64 voteDeadline;        // votes must arrive before this timestamp
-        uint64 resolutionDeadline;  // single-voter no-show settlement unlocks here
+        uint256 creatorStake;
+        uint256 opponentStake;
+        uint256 minOpponentReputation; // 0 = no reputation gate
+        uint64 voteDeadline;
+        uint64 resolutionDeadline;
         Status status;
-        Outcome creatorOutcome;     // creator's bet side (YES or NO)
-        Outcome opponentOutcome;    // opposite of creatorOutcome (set on accept)
-        Outcome creatorVote;        // creator's reported outcome (NONE = not voted)
-        Outcome opponentVote;       // opponent's reported outcome
+        Outcome creatorOutcome;
+        Outcome opponentOutcome;
+        Outcome creatorVote;
+        Outcome opponentVote;
         string question;
     }
 
@@ -62,16 +59,15 @@ contract PredictionDuel is ReentrancyGuard {
     // Storage
     // ------
 
-    /// @notice Total number of duels ever created. Also the highest assigned id.
+    /// @notice Linked soulbound reputation registry.
+    DuelReputation public immutable reputation;
+
     uint256 public duelCounter;
 
     mapping(uint256 => Duel) private _duels;
     mapping(address => uint256[]) private _userDuels;
 
-    /// @notice ETH credited to each address by settlements, refunds, and
-    ///         cancellations. Owners must call `withdraw()` to claim. This
-    ///         is the pull-payment pattern: settlement never fails because
-    ///         a participant cannot receive ETH.
+    /// @notice Pull-payment balances. Owners claim via `withdraw()`.
     mapping(address => uint256) public pendingWithdrawals;
 
     // ------
@@ -84,6 +80,7 @@ contract PredictionDuel is ReentrancyGuard {
         Outcome creatorOutcome,
         uint256 creatorStake,
         uint256 opponentStake,
+        uint256 minOpponentReputation,
         uint64 voteDeadline,
         uint64 resolutionDeadline,
         string question
@@ -119,21 +116,30 @@ contract PredictionDuel is ReentrancyGuard {
     error TransferFailed();
     error InvalidPagination();
     error NothingToWithdraw();
+    error InsufficientReputation();
+    error ZeroAddress();
+
+    // ------
+    // Constructor
+    // ------
+
+    constructor(address reputationAddr) {
+        if (reputationAddr == address(0)) revert ZeroAddress();
+        reputation = DuelReputation(reputationAddr);
+    }
 
     // ------
     // External / public functions
     // ------
 
-    /// @notice Create a duel with asymmetric stakes.
-    /// @dev    The creator pays `msg.value` (= `creatorStake`) up-front and
-    ///         declares the opponent's required stake separately, so the
-    ///         odds are encoded in the stake ratio (e.g. 80/20 means the
-    ///         creator risks 80 to win an extra 20, the opponent risks 20
-    ///         to win an extra 80). Both stakes must be > 0.
+    /// @notice Create a duel with asymmetric stakes and an optional minimum
+    ///         reputation requirement on the future opponent.
     /// @param  question The yes/no question being wagered on.
     /// @param  creatorOutcome The creator's bet side. Must be YES or NO.
-    /// @param  opponentStake Exact ETH (in wei) the opponent will need to
-    ///         send at accept-time. Must be > 0.
+    /// @param  opponentStake Exact ETH (in wei) the opponent must send to accept.
+    /// @param  minOpponentReputation Minimum reputation score the opponent
+    ///         must hold at accept-time (compared against int256). Pass 0
+    ///         to allow any opponent including unscored newcomers.
     /// @param  voteDeadline Timestamp after which voting is closed.
     /// @param  resolutionDeadline Timestamp after which a single-voter
     ///         no-show settlement may be triggered. Must be > voteDeadline.
@@ -142,6 +148,7 @@ contract PredictionDuel is ReentrancyGuard {
         string calldata question,
         Outcome creatorOutcome,
         uint256 opponentStake,
+        uint256 minOpponentReputation,
         uint64 voteDeadline,
         uint64 resolutionDeadline
     ) external payable nonReentrant returns (uint256 id) {
@@ -160,6 +167,7 @@ contract PredictionDuel is ReentrancyGuard {
         d.creator = msg.sender;
         d.creatorStake = msg.value;
         d.opponentStake = opponentStake;
+        d.minOpponentReputation = minOpponentReputation;
         d.voteDeadline = voteDeadline;
         d.resolutionDeadline = resolutionDeadline;
         d.status = Status.CREATED;
@@ -174,14 +182,16 @@ contract PredictionDuel is ReentrancyGuard {
             creatorOutcome,
             msg.value,
             opponentStake,
+            minOpponentReputation,
             voteDeadline,
             resolutionDeadline,
             question
         );
     }
 
-    /// @notice Accept an open duel by sending exactly `opponentStake` ETH.
-    ///         Caller is locked into the side opposite to the creator.
+    /// @notice Accept an open duel. The caller must (a) send exactly
+    ///         `opponentStake` ETH and (b) have a reputation score that
+    ///         meets the duel's `minOpponentReputation`.
     /// @param  id The duel id.
     function acceptDuel(uint256 id) external payable nonReentrant {
         Duel storage d = _duels[id];
@@ -190,6 +200,16 @@ contract PredictionDuel is ReentrancyGuard {
         if (msg.sender == d.creator) revert CreatorCannotAccept();
         if (msg.value != d.opponentStake) revert WrongStakeAmount();
         if (block.timestamp >= d.voteDeadline) revert VotingClosed();
+
+        if (d.minOpponentReputation > 0) {
+            int256 oppScore = reputation.reputationScore(msg.sender);
+            // Negative-score users always fail a positive gate; otherwise
+            // compare unsigned to avoid an int256 cast of a user-supplied
+            // value that could wrap.
+            if (oppScore < 0 || uint256(oppScore) < d.minOpponentReputation) {
+                revert InsufficientReputation();
+            }
+        }
 
         Outcome opp = d.creatorOutcome == Outcome.YES ? Outcome.NO : Outcome.YES;
 
@@ -203,12 +223,6 @@ contract PredictionDuel is ReentrancyGuard {
     }
 
     /// @notice Submit your vote on what actually happened.
-    /// @dev    Each participant may vote once. Voting is allowed up to (but
-    ///         not including) `voteDeadline`. INVALID is allowed and signals
-    ///         "the event is unresolvable"; if both vote INVALID, both are
-    ///         refunded at settlement.
-    /// @param  id The duel id.
-    /// @param  vote YES, NO, or INVALID.
     function submitVote(uint256 id, Outcome vote) external {
         if (vote == Outcome.NONE) revert InvalidOutcome();
 
@@ -236,10 +250,9 @@ contract PredictionDuel is ReentrancyGuard {
         emit VoteSubmitted(id, msg.sender, vote);
     }
 
-    /// @notice Settle a duel. Callable by anyone once the vote deadline has
-    ///         passed. Funds are credited to `pendingWithdrawals`; recipients
-    ///         claim via `withdraw()`.
-    /// @param  id The duel id.
+    /// @notice Settle a duel. Callable by anyone once `voteDeadline` has
+    ///         passed. Updates reputation counters, credits the winner /
+    ///         refundees, and emits the corresponding event.
     function settleDuel(uint256 id) external nonReentrant {
         Duel storage d = _duels[id];
         if (d.creator == address(0)) revert DuelNotFound();
@@ -254,37 +267,48 @@ contract PredictionDuel is ReentrancyGuard {
         if (creatorVoted && opponentVoted) {
             if (cv == ov) {
                 if (cv == Outcome.INVALID) {
+                    // Clean refund — neither side is rewarded or punished.
                     _refundBoth(d, id);
                 } else {
                     _payWinner(d, id, cv);
                 }
             } else {
-                // TODO Phase 5: route to dispute resolution. For now we just
-                // mark the duel DISPUTED and leave the funds locked.
+                // TODO Phase 5: invoke a dispute-resolution mechanism here.
+                // Phase 5 should call reputation.recordDisputeWin(winner) and
+                // reputation.recordDisputeLoss(loser) once a verdict is reached.
                 d.status = Status.DISPUTED;
                 emit DuelDisputed(id);
             }
             return;
         }
 
-        // At least one side did not vote: wait for the resolution deadline.
+        // At least one side did not vote — wait out the resolution deadline.
         if (block.timestamp < d.resolutionDeadline) revert ResolutionDeadlineNotReached();
 
         if (!creatorVoted && !opponentVoted) {
+            // Both sides no-show: refund stakes and penalise both.
+            address creator = d.creator;
+            address opponent = d.opponent;
             _refundBoth(d, id);
+            reputation.recordNoShow(creator);
+            reputation.recordNoShow(opponent);
         } else {
-            address winner = creatorVoted ? d.creator : d.opponent;
-            Outcome decidingVote = creatorVoted ? cv : ov;
+            // Single voter wins the full pot; the absentee is logged as a no-show.
+            bool creatorIsWinner = creatorVoted;
+            address winner = creatorIsWinner ? d.creator : d.opponent;
+            address loser = creatorIsWinner ? d.opponent : d.creator;
+            uint256 winnerStake = creatorIsWinner ? d.creatorStake : d.opponentStake;
+            Outcome decidingVote = creatorIsWinner ? cv : ov;
             uint256 prize = d.creatorStake + d.opponentStake;
             d.status = Status.SETTLED;
             emit DuelSettled(id, winner, prize, decidingVote);
             _credit(winner, prize);
+            reputation.recordWin(winner, winnerStake);
+            reputation.recordNoShow(loser);
         }
     }
 
     /// @notice Cancel an open, unaccepted duel and recover the creator's stake.
-    /// @dev    Stake is credited to `pendingWithdrawals[creator]`; claim via `withdraw()`.
-    /// @param  id The duel id.
     function cancelDuel(uint256 id) external nonReentrant {
         Duel storage d = _duels[id];
         if (d.creator == address(0)) revert DuelNotFound();
@@ -297,12 +321,7 @@ contract PredictionDuel is ReentrancyGuard {
         _credit(msg.sender, refund);
     }
 
-    /// @notice Withdraw all ETH credited to the caller.
-    /// @dev    Pull-payment claim. CEI is enforced (balance is zeroed before
-    ///         the external call) and `nonReentrant` adds belt-and-braces. If
-    ///         the recipient's `receive()` reverts, the whole call reverts and
-    ///         the credit is preserved for a later retry.
-    /// @return amount Wei sent to the caller.
+    /// @notice Withdraw all ETH credited to the caller (pull-payment claim).
     function withdraw() external nonReentrant returns (uint256 amount) {
         amount = pendingWithdrawals[msg.sender];
         if (amount == 0) revert NothingToWithdraw();
@@ -316,22 +335,12 @@ contract PredictionDuel is ReentrancyGuard {
     // Views
     // ------
 
-    /// @notice Fetch a duel by id.
-    /// @param  id The duel id.
-    /// @return The full duel struct.
     function getDuel(uint256 id) external view returns (Duel memory) {
         Duel storage d = _duels[id];
         if (d.creator == address(0)) revert DuelNotFound();
         return d;
     }
 
-    /// @notice Paginated view of all duels not yet SETTLED or CANCELLED,
-    ///         ordered by id ascending.
-    /// @dev    `offset` and `limit` are applied over the *filtered* list of
-    ///         active duels.
-    /// @param  offset Number of active duels to skip.
-    /// @param  limit  Maximum number of duels to return. Must be > 0.
-    /// @return result The active duels in the requested page.
     function getActiveDuels(uint256 offset, uint256 limit)
         external
         view
@@ -362,11 +371,19 @@ contract PredictionDuel is ReentrancyGuard {
         }
     }
 
-    /// @notice All duel ids that `user` has either created or accepted.
-    /// @param  user The address to query.
-    /// @return Array of duel ids in chronological order of involvement.
     function getUserDuels(address user) external view returns (uint256[] memory) {
         return _userDuels[user];
+    }
+
+    /// @notice Proxy to the reputation registry, returning both the raw
+    ///         counters and the derived score.
+    function getDuelistReputation(address user)
+        external
+        view
+        returns (DuelReputation.Reputation memory rep, int256 score)
+    {
+        rep = reputation.getReputation(user);
+        score = reputation.reputationScore(user);
     }
 
     // ------
@@ -374,11 +391,17 @@ contract PredictionDuel is ReentrancyGuard {
     // ------
 
     function _payWinner(Duel storage d, uint256 id, Outcome consensus) private {
-        address winner = (consensus == d.creatorOutcome) ? d.creator : d.opponent;
+        bool creatorIsWinner = (consensus == d.creatorOutcome);
+        address winner = creatorIsWinner ? d.creator : d.opponent;
+        address loser = creatorIsWinner ? d.opponent : d.creator;
+        uint256 winnerStake = creatorIsWinner ? d.creatorStake : d.opponentStake;
+        uint256 loserStake = creatorIsWinner ? d.opponentStake : d.creatorStake;
         uint256 prize = d.creatorStake + d.opponentStake;
         d.status = Status.SETTLED;
         emit DuelSettled(id, winner, prize, consensus);
         _credit(winner, prize);
+        reputation.recordWin(winner, winnerStake);
+        reputation.recordLoss(loser, loserStake);
     }
 
     function _refundBoth(Duel storage d, uint256 id) private {
@@ -393,8 +416,6 @@ contract PredictionDuel is ReentrancyGuard {
     }
 
     function _credit(address to, uint256 amount) private {
-        // Overflow is impossible here because the sum of all credits cannot
-        // exceed the total ETH supply, which is far below uint256 max.
         unchecked {
             pendingWithdrawals[to] += amount;
         }

@@ -10,12 +10,14 @@ export default defineConfig({
         version: "0.8.35",
         settings: {
           optimizer: { enabled: true, runs: 200 },
+          viaIR: true,
         },
       },
       production: {
         version: "0.8.35",
         settings: {
           optimizer: { enabled: true, runs: 200 },
+          viaIR: true,
         },
       },
     },

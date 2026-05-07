@@ -18,10 +18,30 @@ const QUESTION = "Will BTC be below $50k on Dec 31 2026?";
 const CREATOR_STAKE = ethers.parseEther("0.8");
 const OPPONENT_STAKE = ethers.parseEther("0.2");
 
+const NO_REP_GATE = 0n;
+
 async function deployFixture() {
   const [deployer, alice, bob, charlie] = await ethers.getSigners();
-  const contract = await ethers.deployContract("PredictionDuel");
+
+  // PredictionDuel and DuelReputation reference each other in their
+  // constructors. Predict the PredictionDuel address (deployer's nonce + 1)
+  // so we can deploy reputation first.
+  const nonce = await ethers.provider.getTransactionCount(deployer.address);
+  const predictedDuelAddr = ethers.getCreateAddress({
+    from: deployer.address,
+    nonce: nonce + 1,
+  });
+  const reputation = await ethers.deployContract("DuelReputation", [predictedDuelAddr]);
+  await reputation.waitForDeployment();
+
+  const contract = await ethers.deployContract("PredictionDuel", [
+    await reputation.getAddress(),
+  ]);
   await contract.waitForDeployment();
+
+  if ((await contract.getAddress()).toLowerCase() !== predictedDuelAddr.toLowerCase()) {
+    throw new Error("Address prediction mismatch — contracts cannot be linked.");
+  }
 
   const now = await time.latest();
   const voteDeadline = now + 3600;
@@ -29,6 +49,7 @@ async function deployFixture() {
 
   return {
     contract,
+    reputation,
     deployer,
     alice,
     bob,
@@ -46,9 +67,15 @@ async function activeDuelFixture() {
 
   await contract
     .connect(alice)
-    .createDuel(QUESTION, Outcome.YES, opponentStake, voteDeadline, resolutionDeadline, {
-      value: creatorStake,
-    });
+    .createDuel(
+      QUESTION,
+      Outcome.YES,
+      opponentStake,
+      NO_REP_GATE,
+      voteDeadline,
+      resolutionDeadline,
+      { value: creatorStake },
+    );
   await contract.connect(bob).acceptDuel(1, { value: opponentStake });
 
   return { ...base, duelId: 1n };
@@ -79,7 +106,7 @@ describe("PredictionDuel", function () {
 
       const tx = contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -91,6 +118,7 @@ describe("PredictionDuel", function () {
           Outcome.YES,
           creatorStake,
           opponentStake,
+          NO_REP_GATE,
           voteDeadline,
           resolutionDeadline,
           QUESTION,
@@ -122,7 +150,7 @@ describe("PredictionDuel", function () {
 
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -257,7 +285,7 @@ describe("PredictionDuel", function () {
       await expect(
         contract
           .connect(alice)
-          .createDuel(QUESTION, Outcome.YES, opponentStake, voteDeadline, resolutionDeadline, {
+          .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
             value: 0,
           }),
       ).to.be.revertedWithCustomError(contract, "ZeroStake");
@@ -269,7 +297,7 @@ describe("PredictionDuel", function () {
 
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -288,7 +316,7 @@ describe("PredictionDuel", function () {
 
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -311,7 +339,7 @@ describe("PredictionDuel", function () {
 
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -412,7 +440,7 @@ describe("PredictionDuel", function () {
 
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -484,7 +512,7 @@ describe("PredictionDuel", function () {
       // Alice (creator, YES) vs Attacker (opponent, NO).
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -531,6 +559,286 @@ describe("PredictionDuel", function () {
         contract,
         "NothingToWithdraw",
       );
+    });
+  });
+
+  // ------
+  // Reputation system (DuelReputation integration)
+  // ------
+
+  describe("Reputation: lazy mint & soulbound", function () {
+    it("24. Should lazy-mint reputation NFTs to both participants on settle", async function () {
+      const { contract, reputation, alice, bob, voteDeadline } =
+        await loadFixture(activeDuelFixture);
+
+      expect(await reputation.balanceOf(alice.address)).to.equal(0n);
+      expect(await reputation.balanceOf(bob.address)).to.equal(0n);
+
+      await contract.connect(alice).submitVote(1, Outcome.YES);
+      await contract.connect(bob).submitVote(1, Outcome.YES);
+      await time.increaseTo(voteDeadline);
+      await contract.settleDuel(1);
+
+      expect(await reputation.balanceOf(alice.address)).to.equal(1n);
+      expect(await reputation.balanceOf(bob.address)).to.equal(1n);
+
+      const aliceTokenId = await reputation.tokenIdOf(alice.address);
+      expect(await reputation.ownerOf(aliceTokenId)).to.equal(alice.address);
+    });
+
+    it("25. Should revert any transferFrom (soulbound enforcement)", async function () {
+      const { contract, reputation, alice, bob, charlie, voteDeadline } =
+        await loadFixture(activeDuelFixture);
+
+      await contract.connect(alice).submitVote(1, Outcome.YES);
+      await contract.connect(bob).submitVote(1, Outcome.YES);
+      await time.increaseTo(voteDeadline);
+      await contract.settleDuel(1);
+
+      const tokenId = await reputation.tokenIdOf(alice.address);
+
+      await expect(
+        reputation.connect(alice).transferFrom(alice.address, charlie.address, tokenId),
+      ).to.be.revertedWithCustomError(reputation, "SoulboundTransferDisallowed");
+
+      await expect(
+        reputation
+          .connect(alice)
+          ["safeTransferFrom(address,address,uint256)"](
+            alice.address,
+            charlie.address,
+            tokenId,
+          ),
+      ).to.be.revertedWithCustomError(reputation, "SoulboundTransferDisallowed");
+    });
+
+    it("26. Should reject record* calls from non-duel callers", async function () {
+      const { reputation, alice } = await loadFixture(deployFixture);
+
+      await expect(
+        reputation.connect(alice).recordWin(alice.address, 1n),
+      ).to.be.revertedWithCustomError(reputation, "NotDuelContract");
+
+      await expect(
+        reputation.connect(alice).mintIfNeeded(alice.address),
+      ).to.be.revertedWithCustomError(reputation, "NotDuelContract");
+    });
+  });
+
+  describe("Reputation: scoring formula", function () {
+    it("27. Should match documented winPointsForStake values at boundaries", async function () {
+      const { reputation } = await loadFixture(deployFixture);
+
+      // Sub-baseline → flat 2
+      expect(await reputation.winPointsForStake(0n)).to.equal(2n);
+      expect(await reputation.winPointsForStake(ethers.parseEther("0.0001"))).to.equal(2n);
+
+      // At baseline (0.001 ETH): 2 + log2(1) = 2
+      expect(await reputation.winPointsForStake(ethers.parseEther("0.001"))).to.equal(2n);
+
+      // 0.01 ETH: 2 + log2(10) = 2 + 3 = 5
+      expect(await reputation.winPointsForStake(ethers.parseEther("0.01"))).to.equal(5n);
+
+      // 0.8 ETH: 2 + log2(800) = 2 + 9 = 11
+      expect(await reputation.winPointsForStake(ethers.parseEther("0.8"))).to.equal(11n);
+
+      // 1 ETH: 2 + log2(1000) = 2 + 9 = 11
+      expect(await reputation.winPointsForStake(ethers.parseEther("1"))).to.equal(11n);
+
+      // 1024 ETH: 2 + log2(1_024_000) = 2 + 19 = 21
+      expect(await reputation.winPointsForStake(ethers.parseEther("1024"))).to.equal(21n);
+    });
+
+    it("28. Should credit stake-weighted win points and zero loss points", async function () {
+      const { contract, reputation, alice, bob, voteDeadline, creatorStake, opponentStake } =
+        await loadFixture(activeDuelFixture);
+
+      await contract.connect(alice).submitVote(1, Outcome.YES);
+      await contract.connect(bob).submitVote(1, Outcome.YES);
+      await time.increaseTo(voteDeadline);
+      await contract.settleDuel(1);
+
+      const aliceRep = await reputation.getReputation(alice.address);
+      expect(aliceRep.wins).to.equal(1n);
+      expect(aliceRep.losses).to.equal(0n);
+      expect(aliceRep.winPointsAccum).to.equal(11n); // 0.8 ETH stake
+      expect(aliceRep.totalVolumeWei).to.equal(creatorStake);
+
+      const bobRep = await reputation.getReputation(bob.address);
+      expect(bobRep.wins).to.equal(0n);
+      expect(bobRep.losses).to.equal(1n);
+      expect(bobRep.winPointsAccum).to.equal(0n);
+      expect(bobRep.totalVolumeWei).to.equal(opponentStake);
+
+      expect(await reputation.reputationScore(alice.address)).to.equal(11n);
+      expect(await reputation.reputationScore(bob.address)).to.equal(0n);
+    });
+
+    it("29. Should apply base no-show penalty (10) for fresh users", async function () {
+      const { contract, reputation, alice, bob, resolutionDeadline } =
+        await loadFixture(activeDuelFixture);
+
+      await time.increaseTo(resolutionDeadline);
+      await contract.settleDuel(1);
+
+      const aliceRep = await reputation.getReputation(alice.address);
+      expect(aliceRep.noShowCount).to.equal(1n);
+      expect(aliceRep.noShowPenaltyAccum).to.equal(10n);
+
+      expect(await reputation.reputationScore(alice.address)).to.equal(-10n);
+      expect(await reputation.reputationScore(bob.address)).to.equal(-10n);
+    });
+  });
+
+  describe("Reputation: gating", function () {
+    it("30. Should reject acceptors below minOpponentReputation", async function () {
+      const {
+        contract,
+        alice,
+        bob,
+        voteDeadline,
+        resolutionDeadline,
+        creatorStake,
+        opponentStake,
+      } = await loadFixture(deployFixture);
+
+      await contract
+        .connect(alice)
+        .createDuel(
+          QUESTION,
+          Outcome.YES,
+          opponentStake,
+          5n, // require score >= 5
+          voteDeadline,
+          resolutionDeadline,
+          { value: creatorStake },
+        );
+
+      // Bob is unscored (score 0); the gate must reject.
+      await expect(
+        contract.connect(bob).acceptDuel(1, { value: opponentStake }),
+      ).to.be.revertedWithCustomError(contract, "InsufficientReputation");
+    });
+
+    it("31. Should accept opponents who meet the rep gate", async function () {
+      const { contract, alice, bob, charlie, opponentStake, creatorStake } =
+        await loadFixture(deployFixture);
+
+      // Round 1: bob beats charlie in an ungated duel to earn score (>= 5).
+      const t0 = await time.latest();
+      const vd1 = t0 + 600;
+      const rd1 = t0 + 1200;
+      await contract
+        .connect(bob)
+        .createDuel(
+          QUESTION,
+          Outcome.YES,
+          opponentStake,
+          NO_REP_GATE,
+          vd1,
+          rd1,
+          { value: creatorStake },
+        );
+      await contract.connect(charlie).acceptDuel(1, { value: opponentStake });
+      await contract.connect(bob).submitVote(1, Outcome.YES);
+      await contract.connect(charlie).submitVote(1, Outcome.YES);
+      await time.increaseTo(vd1);
+      await contract.settleDuel(1);
+
+      // Bob now has 11 win points from a 0.8 ETH stake.
+      // Round 2: alice creates a gated duel; bob can accept.
+      const t1 = await time.latest();
+      const vd2 = t1 + 600;
+      const rd2 = t1 + 1200;
+      await contract
+        .connect(alice)
+        .createDuel(
+          QUESTION,
+          Outcome.YES,
+          opponentStake,
+          5n,
+          vd2,
+          rd2,
+          { value: creatorStake },
+        );
+
+      await expect(contract.connect(bob).acceptDuel(2, { value: opponentStake }))
+        .to.emit(contract, "DuelAccepted")
+        .withArgs(2n, bob.address, Outcome.NO);
+    });
+  });
+
+  describe("Reputation: decay", function () {
+    it("32. Should halve positive winPointsAccum after one decay period of inactivity", async function () {
+      const { contract, reputation, alice, bob, voteDeadline } =
+        await loadFixture(activeDuelFixture);
+
+      await contract.connect(alice).submitVote(1, Outcome.YES);
+      await contract.connect(bob).submitVote(1, Outcome.YES);
+      await time.increaseTo(voteDeadline);
+      await contract.settleDuel(1);
+
+      // Alice has 11 win points, fresh.
+      expect(await reputation.reputationScore(alice.address)).to.equal(11n);
+
+      // Advance one full halving period (365 days + slack).
+      await time.increase(365 * 24 * 60 * 60 + 1);
+
+      // Read-side decay: 11 >> 1 == 5
+      expect(await reputation.reputationScore(alice.address)).to.equal(5n);
+
+      // Storage isn't yet rebased — that happens on the next write.
+      const repBefore = await reputation.getReputation(alice.address);
+      expect(repBefore.winPointsAccum).to.equal(11n);
+    });
+
+    it("33. Should NOT decay sticky negative reputation (no-show penalty)", async function () {
+      const { contract, reputation, alice, resolutionDeadline } =
+        await loadFixture(activeDuelFixture);
+
+      await time.increaseTo(resolutionDeadline);
+      await contract.settleDuel(1);
+
+      expect(await reputation.reputationScore(alice.address)).to.equal(-10n);
+
+      await time.increase(2 * 365 * 24 * 60 * 60); // 2 years inactive
+
+      // Bad rep is sticky.
+      expect(await reputation.reputationScore(alice.address)).to.equal(-10n);
+    });
+  });
+
+  describe("Reputation: tokenURI", function () {
+    it("34. Should return inline base64 JSON metadata", async function () {
+      const { contract, reputation, alice, bob, voteDeadline } =
+        await loadFixture(activeDuelFixture);
+
+      await contract.connect(alice).submitVote(1, Outcome.YES);
+      await contract.connect(bob).submitVote(1, Outcome.YES);
+      await time.increaseTo(voteDeadline);
+      await contract.settleDuel(1);
+
+      const tokenId = await reputation.tokenIdOf(alice.address);
+      const uri = await reputation.tokenURI(tokenId);
+
+      expect(uri.startsWith("data:application/json;base64,")).to.equal(true);
+
+      const json = JSON.parse(
+        Buffer.from(uri.slice("data:application/json;base64,".length), "base64").toString(
+          "utf8",
+        ),
+      );
+
+      expect(json.name).to.match(/^PredictionDuel Reputation #/);
+      expect(json.attributes).to.be.an("array");
+
+      const byName: Record<string, number | string> = {};
+      for (const a of json.attributes) byName[a.trait_type] = a.value;
+
+      expect(byName["Score"]).to.equal(11);
+      expect(byName["Wins"]).to.equal(1);
+      expect(byName["Losses"]).to.equal(0);
+      expect(byName["No-shows"]).to.equal(0);
     });
   });
 });
