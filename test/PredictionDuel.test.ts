@@ -1486,7 +1486,7 @@ describe("PredictionDuel", function () {
         .and.to.emit(contract, "DuelRefunded").withArgs(1n, f.creatorStake, f.opponentStake);
 
       // Fee pool on INVALID is split 50/50: 0.01 escalation + 2 × 0.02 minority slashes = 0.05 ETH.
-      // (j1 voted YES and j2 voted NO; j3 voted INVALID — only j3 matched the
+      // (j1 voted YES and j2 voted NO; j3 voted INVALID - only j3 matched the
       // verdict, so j1 and j2 are minority and each lose SLASH_AMOUNT.)
       const half = ethers.parseEther("0.025");
       expect(await contract.pendingWithdrawals(f.alice.address)).to.equal(f.creatorStake + half);
@@ -1551,7 +1551,7 @@ describe("PredictionDuel", function () {
       await time.increaseTo(f.voteDeadline);
       await contract.settleDuel(1); // -> DISPUTED, no escalation
 
-      // Before grace period elapses → revert.
+      // Before grace period elapses - revert.
       await expect(contract.cancelStaleDispute(1))
         .to.be.revertedWithCustomError(contract, "EscalationGraceNotReached");
 

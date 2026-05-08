@@ -119,7 +119,7 @@ async function main() {
     );
     console.log(`\nOr run:  npx hardhat run scripts/verify.ts --network ${networkName}`);
   } else {
-    console.log("\n(Local network — skipping Etherscan verification hint.)");
+    console.log("\n(Local network - skipping Etherscan verification hint.)");
   }
 }
 
