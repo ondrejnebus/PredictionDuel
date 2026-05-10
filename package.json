@@ -31,6 +31,7 @@
     "typescript": "^6.0.3"
   },
   "dependencies": {
-    "@openzeppelin/contracts": "^5.6.1"
+    "@openzeppelin/contracts": "^5.6.1",
+    "dependencies": "^0.0.1"
   }
 }
