@@ -11,6 +11,7 @@ export type DuelView = {
   creatorStake: bigint;
   opponentStake: bigint;
   minOpponentReputation: bigint;
+  votingStart: bigint;
   voteDeadline: bigint;
   resolutionDeadline: bigint;
   status: number;
@@ -19,6 +20,7 @@ export type DuelView = {
   creatorVote: number;
   opponentVote: number;
   question: string;
+  description: string;
 };
 
 export function DuelCard({ duel }: { duel: DuelView }) {
@@ -28,9 +30,16 @@ export function DuelCard({ duel }: { duel: DuelView }) {
       <Card className="transition-colors hover:border-primary/60">
         <CardContent className="space-y-3 p-5">
           <div className="flex items-start justify-between gap-3">
-            <h3 className="line-clamp-2 text-base font-medium leading-snug group-hover:text-primary">
-              {duel.question}
-            </h3>
+            <div className="min-w-0 flex-1 space-y-1">
+              <h3 className="line-clamp-2 text-base font-medium leading-snug group-hover:text-primary">
+                {duel.question}
+              </h3>
+              {duel.description && (
+                <p className="line-clamp-2 text-xs text-muted-foreground">
+                  {duel.description}
+                </p>
+              )}
+            </div>
             <StatusBadge status={duel.status} />
           </div>
 
@@ -50,8 +59,16 @@ export function DuelCard({ duel }: { duel: DuelView }) {
               </div>
             </div>
             <Field
-              label="Vote in"
-              value={timeUntil(duel.voteDeadline)}
+              label={
+                Date.now() / 1000 < Number(duel.votingStart)
+                  ? "Voting opens"
+                  : "Vote ends"
+              }
+              value={
+                Date.now() / 1000 < Number(duel.votingStart)
+                  ? timeUntil(duel.votingStart)
+                  : timeUntil(duel.voteDeadline)
+              }
             />
           </div>
 

@@ -26,14 +26,15 @@ import { predictionDuel } from "@/lib/contracts";
 import type { DuelView } from "@/components/duel-card";
 
 // Tuple ordering matches Solidity: PredictionDuel.getDisputeData()
-// (round, lastRoundOutcome, selectedJurors, votingDeadline, appealDeadline,
-//  round1Loser, round2Loser, feePool, initialized, finalized)
+// (round, lastRoundOutcome, selectedJurors, commitDeadline, revealDeadline,
+//  appealDeadline, round1Loser, round2Loser, feePool, initialized, finalized)
 type DisputeTuple = readonly [
   number,
   number,
   readonly `0x${string}`[],
-  bigint,
-  bigint,
+  bigint, // commitDeadline
+  bigint, // revealDeadline
+  bigint, // appealDeadline
   `0x${string}`,
   `0x${string}`,
   bigint,
@@ -76,9 +77,16 @@ export default function DuelDetailPage({
         </div>
         {isLoading && <Skeleton className="h-10 w-3/4" />}
         {duel && (
-          <h1 className="text-2xl font-semibold tracking-tight">
-            {duel.question}
-          </h1>
+          <>
+            <h1 className="text-2xl font-semibold tracking-tight">
+              {duel.question}
+            </h1>
+            {duel.description && (
+              <p className="whitespace-pre-line text-sm text-muted-foreground">
+                {duel.description}
+              </p>
+            )}
+          </>
         )}
       </header>
 
@@ -161,6 +169,11 @@ function TimelineCard({ duel }: { duel: DuelView }) {
         <CardTitle>Timeline</CardTitle>
       </CardHeader>
       <CardContent className="space-y-2 text-sm">
+        <Row
+          k="Voting opens"
+          v={fmtDeadline(duel.votingStart)}
+          hint={formatCountdown(duel.votingStart, now)}
+        />
         <Row
           k="Vote deadline"
           v={fmtDeadline(duel.voteDeadline)}
@@ -261,7 +274,8 @@ function DisputePanel({
     round,
     lastRoundOutcome,
     panel,
-    votingDeadline,
+    commitDeadline,
+    revealDeadline,
     appealDeadline,
     round1Loser,
     round2Loser,
@@ -278,7 +292,11 @@ function DisputePanel({
 
   const inAppeal = appealDeadline !== 0n;
   const appealOpen = inAppeal && now / 1000 < Number(appealDeadline);
-  const votingOpen = votingDeadline !== 0n && now / 1000 < Number(votingDeadline);
+  const inCommit = commitDeadline !== 0n && now / 1000 < Number(commitDeadline);
+  const inReveal =
+    commitDeadline !== 0n &&
+    now / 1000 >= Number(commitDeadline) &&
+    now / 1000 < Number(revealDeadline);
   const currentLoser = round === 1 ? round1Loser : round === 2 ? round2Loser : ZERO_ADDR;
   const meIsLoser =
     me && currentLoser !== ZERO_ADDR && me.toLowerCase() === currentLoser.toLowerCase();
@@ -303,7 +321,8 @@ function DisputePanel({
           Dispute
           <Badge variant="primary">Round {round} / 3</Badge>
           {finalized && <Badge variant="success">Finalized</Badge>}
-          {!finalized && votingOpen && <Badge variant="warn">Voting open</Badge>}
+          {!finalized && inCommit && <Badge variant="warn">Commit phase</Badge>}
+          {!finalized && inReveal && <Badge variant="warn">Reveal phase</Badge>}
           {!finalized && appealOpen && <Badge variant="warn">Appeal open</Badge>}
         </CardTitle>
       </CardHeader>
@@ -311,11 +330,18 @@ function DisputePanel({
         <div className="grid gap-3 sm:grid-cols-2">
           <Row k="Panel size" v={`${panel.length} juror${panel.length === 1 ? "" : "s"}`} />
           <RowEth k="Fee pool" wei={feePool} />
-          {votingDeadline !== 0n && (
+          {commitDeadline !== 0n && (
             <Row
-              k="Voting deadline"
-              v={fmtDeadline(votingDeadline)}
-              hint={formatCountdown(votingDeadline, now)}
+              k="Commit deadline"
+              v={fmtDeadline(commitDeadline)}
+              hint={formatCountdown(commitDeadline, now)}
+            />
+          )}
+          {revealDeadline !== 0n && (
+            <Row
+              k="Reveal deadline"
+              v={fmtDeadline(revealDeadline)}
+              hint={formatCountdown(revealDeadline, now)}
             />
           )}
           {appealDeadline !== 0n && (
@@ -355,7 +381,7 @@ function DisputePanel({
         )}
 
         {canAppeal && (
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-warn/40 bg-warn/5 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
             <div>
               <div className="font-medium">You lost round {round}.</div>
               <div className="text-xs text-muted-foreground">
@@ -421,7 +447,14 @@ function Actions({
     me &&
     duel.opponent !== ZERO_ADDR &&
     me.toLowerCase() === duel.opponent.toLowerCase();
-  const votingOpen = now / 1000 < Number(duel.voteDeadline);
+  const nowSec = now / 1000;
+  // Acceptance is allowed only before votingStart so the opponent cannot
+  // join after the event is already known.
+  const acceptanceOpen = nowSec < Number(duel.votingStart);
+  // Voting is allowed only inside [votingStart, voteDeadline).
+  const votingOpen =
+    nowSec >= Number(duel.votingStart) && nowSec < Number(duel.voteDeadline);
+  const voteEnded = nowSec >= Number(duel.voteDeadline);
 
   // wagmi's writeContract has a discriminated-union arg type per functionName,
   // which TS can't narrow when called through a generic helper. We loosen the
@@ -446,7 +479,7 @@ function Actions({
           {!me && <p className="text-sm text-muted-foreground">Connect a wallet to act.</p>}
           {me && !isCreator && (
             <Button
-              disabled={isPending || !votingOpen}
+              disabled={isPending || !acceptanceOpen}
               onClick={() =>
                 send("Accept", {
                   ...predictionDuel,
@@ -476,9 +509,9 @@ function Actions({
               Cancel duel
             </Button>
           )}
-          {!votingOpen && (
+          {!acceptanceOpen && (
             <p className="text-sm text-muted-foreground">
-              Vote deadline already passed - this duel is no longer acceptable.
+              Voting has already opened - this duel is no longer acceptable.
             </p>
           )}
         </CardContent>
@@ -525,7 +558,13 @@ function Actions({
               You voted <strong>{outcomeLabel[myVote]}</strong>.
             </p>
           )}
-          {!votingOpen && (
+          {!votingOpen && !voteEnded && (isCreator || isOpponent) && (
+            <p className="text-sm text-muted-foreground">
+              Voting opens at {fmtDeadline(duel.votingStart)} (
+              {formatCountdown(duel.votingStart, now)}).
+            </p>
+          )}
+          {voteEnded && (
             <Button
               variant="default"
               disabled={isPending}

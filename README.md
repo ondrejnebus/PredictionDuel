@@ -14,15 +14,19 @@ Two people disagree about whether something will happen. Today they use a
 group chat, a handshake, and good faith. PredictionDuel replaces all three
 with one Solidity contract:
 
-1. **Creator** stakes ETH, picks a yes/no question, picks **both** stakes (so a
+1. **Creator** stakes ETH, writes a yes/no question + an optional long-form
+   **description** (resolution rules, source URL), picks **both** stakes (so a
    confident creator can deliberately give the underdog a 4-to-1 payoff edge),
-   and sets two deadlines.
-2. **Opponent** matches the opposite-side stake. The reputation gate (optional)
-   keeps low-rep accounts out of high-stake duels.
+   and sets three timestamps: when **voting opens**, when it **closes**, and
+   the **resolution deadline** for no-show fallbacks.
+2. **Opponent** matches the opposite-side stake **before voting opens**, so
+   nobody can join after the event is already known. The reputation gate
+   (optional) keeps low-rep accounts out of high-stake duels.
 3. After the event, **both parties vote** on what actually happened.
 4. If they agree -> the contract pays the winner automatically.
-   If they disagree -> a **3 / 5 / 7-juror Kleros-style panel** resolves it;
-   minority jurors are slashed.
+   If they disagree -> a tiered Kleros-style jury (**1 -> 3 -> 5 jurors** across
+   appeals) resolves it through commit-reveal voting; minority jurors and
+   non-revealers are slashed.
 5. Every settled duel updates a **soulbound ERC-721** reputation NFT - wins are
    stake-weighted (`log2`), no-shows are sticky, positive reputation decays
    yearly.
@@ -36,52 +40,21 @@ a closed loop where dispute resolution and accountability are both on-chain.
 
 | Contract | Address | Etherscan |
 |---|---|---|
-| `PredictionDuel` | `0x34e27a22f82aCBBEA6672627B3C8c8AF006733C4` | [verified source](https://sepolia.etherscan.io/address/0x34e27a22f82aCBBEA6672627B3C8c8AF006733C4#code) |
-| `DuelReputation` | `0x8E351b767e54CE32dEbd6fBD7d456d50eAEcB595` | [verified source](https://sepolia.etherscan.io/address/0x8E351b767e54CE32dEbd6fBD7d456d50eAEcB595#code) |
+| `PredictionDuel` | `0x251968A3BF080AA888609Aa2114DB9fC017fd84A` | [verified source](https://sepolia.etherscan.io/address/0x251968A3BF080AA888609Aa2114DB9fC017fd84A#code) |
+| `DuelReputation` | `0xa7E719C61CC259739B025E07f1785d455f5Bc0b6` | [verified source](https://sepolia.etherscan.io/address/0xa7E719C61CC259739B025E07f1785d455f5Bc0b6#code) |
 
 - **Network:** Ethereum Sepolia (chain id `11155111`).
 - **Deployer:** `0x5A684A789998B4Cf338c244073F996575BB5f66e`.
 - **Constructor wiring:** counterfactual two-step deploy (see [Architecture](#3-architecture)).
-- **Frontend:** Next.js 15 app, lives in [`frontend/`](frontend/). Hosted URL listed in
-  [`docs/sepolia-validation.md`](docs/sepolia-validation.md) once deployed; otherwise run
-  locally with `cd frontend && npm install && npm run dev`.
+- **Frontend:** Next.js 15 app, lives in [`frontend/`](frontend/). Hosted URL:
+  [`xebus.xyz`](https://www.xebus.xyz/)
 
 > **End-to-end demo:** open the frontend, connect a Sepolia wallet (faucet:
 > https://sepoliafaucet.com), create a duel, accept from a second wallet, vote,
 > settle - all advertised flows work against the verified addresses above
-> without any local workaround. The full validation log is in
-> [`docs/sepolia-validation.md`](docs/sepolia-validation.md).
+> without any local workaround.
 
 ## 3. Architecture
-
-```
-                ┌────────────────────────────┐
-                │   Next.js 15 + wagmi v2    │  RainbowKit wallet
-                │   (frontend/, App Router)  │  ChainGuard -> Sepolia
-                └──────────────┬─────────────┘
-                               │ viem JSON-RPC
-                               ▼
-        ┌──────────────────────────────────────────────────┐
-        │            PredictionDuel.sol  (Sepolia)         │
-        │                                                  │
-        │  createDuel -> acceptDuel -> submitVote -> settle   │
-        │  • disagreement -> DISPUTED                       │
-        │  • escalateToJury -> claimDispute(FIFO) -> vote    │
-        │  • finalizeJuryRound -> appealDispute (rounds 1-3)│
-        │  • pendingWithdrawals[user] (pull-payment)       │
-        └────────────┬──────────────────────────────┬──────┘
-                     │ recordWin/Loss/DisputeWin/.. │ reads score
-                     ▼                              │
-        ┌──────────────────────────────────────────┴──────┐
-        │           DuelReputation.sol  (Sepolia)         │
-        │                                                  │
-        │  ERC-721, soulbound (transfer reverts)           │
-        │  tokenId = uint256(uint160(addr))                │
-        │  score = log2-weighted wins − dispute losses     │
-        │          − sticky no-show penalty − decay        │
-        │  duelContract = immutable (set in constructor)   │
-        └──────────────────────────────────────────────────┘
-```
 
 The two contracts reference each other in their constructors and
 `DuelReputation.duelContract` is `immutable`. The deploy script uses the
@@ -105,12 +78,24 @@ Compiled with optimizer (`runs: 200`) and `viaIR: true`, Solidity 0.8.35.
 
 ### Lifecycle
 
-* `createDuel` - creator stakes `msg.value`, sets the opponent's required
-  stake, the bet outcome (YES / NO), an optional `minOpponentReputation` gate,
-  a `voteDeadline`, and a `resolutionDeadline`.
-* `acceptDuel` - opponent matches the stake before `voteDeadline`. Reputation
-  gate (if any) is enforced here.
+A duel has three configurable timestamps:
+
+```
+   t=0 (create)        votingStart        voteDeadline        resolutionDeadline
+   |                     |                    |                    |
+   |--- acceptance ------|------ voting ------|--- settle window --|--- no-show ---
+   |                     |                    |
+   acceptDuel must close commit phase opens   settleDuel callable
+   before this           submitVote allowed   after this
+```
+
+* `createDuel(question, description, creatorOutcome, opponentStake, minOpponentReputation, votingStart, voteDeadline, resolutionDeadline)` -
+  creator stakes `msg.value` and sets all three timestamps.
+* `acceptDuel` - opponent matches the stake **before `votingStart`**, so they
+  cannot accept after the event is already known. Reputation gate (if any)
+  is enforced here.
 * `submitVote` - each party reports the actual outcome (YES / NO / INVALID).
+  Only callable inside `[votingStart, voteDeadline)`.
 * `settleDuel` - anyone can call after `voteDeadline`:
   * Both agree (non-INVALID) -> winner gets the full pot, reputation updated.
   * Both vote INVALID -> clean refund.
@@ -118,6 +103,13 @@ Compiled with optimizer (`runs: 200`) and `viaIR: true`, Solidity 0.8.35.
   * One no-show -> solo voter wins the pot, no-shower is penalised.
   * Disagreement -> status moves to `DISPUTED` and waits for `escalateToJury`.
 * `withdraw` - pull-payment claim of any credited balance.
+
+**Why a separate `votingStart`.** A natural duel like *"Will BTC close above
+$50k on Dec 31, 2026?"* needs to delay voting until after the event resolves.
+If the vote could happen at any time before the deadline, the opponent could
+accept after the event is known and immediately submit the right vote. Having
+a `votingStart` strictly later than the event time, and forcing
+`acceptDuel < votingStart`, removes that degree of freedom.
 
 ### Asymmetric stakes & pull payment
 
@@ -151,15 +143,20 @@ When `settleDuel` sees disagreeing votes the duel is parked in `DISPUTED`.
 | `DISPUTE_FEE` | 0.01 ETH |
 | `JUROR_STAKE` | 0.05 ETH |
 | `SLASH_AMOUNT` | 0.02 ETH |
-| `VOTING_PERIOD` | 48 h |
+| `COMMIT_PERIOD` | 24 h |
+| `REVEAL_PERIOD` | 24 h |
 | `APPEAL_WINDOW` | 24 h |
 | `ESCALATION_GRACE` | 7 days |
 
 | Round | Jurors | Fee |
 |---|---|---|
-| 1 | 3 | 1x `DISPUTE_FEE` (0.01 ETH) |
-| 2 | 5 | 3x (0.03 ETH) |
-| 3 | 7 | 9x (0.09 ETH) |
+| 1 | 1 | 1x `DISPUTE_FEE` (0.01 ETH) |
+| 2 | 3 | 3x (0.03 ETH) |
+| 3 | 5 | 9x (0.09 ETH) |
+
+Round 1 starts with a single arbiter — fast and cheap for clear-cut cases. The
+panel grows by 2 (odd sizes prevent ties) only when the round loser pays the
+escalating appeal fee, so frivolous appeals self-fund honest jurors.
 
 **Flow**
 
@@ -167,16 +164,32 @@ When `settleDuel` sees disagreeing votes the duel is parked in `DISPUTED`.
    The duel id enters a FIFO queue; the fee enters the dispute's fee pool.
 2. **Stake & claim** - anyone with `JUROR_STAKE` worth of ETH staked via
    `stakeAsJuror()` can call `claimDispute()` to claim the queue's front.
-   Once enough jurors have claimed it the queue advances and a `VOTING_PERIOD`
-   opens. Duel participants are blocked from joining their own panel.
-3. **Vote** - `juryVote(id, outcome)` during the voting window.
-4. **Tally** - anyone calls `finalizeJuryRound(id)`:
-   * Majority verdict wins; minority jurors lose `SLASH_AMOUNT`.
+   Once enough jurors have claimed it the queue advances; a `COMMIT_PERIOD`
+   opens followed by an equal-length `REVEAL_PERIOD`. Duel participants are
+   blocked from joining their own panel.
+3. **Commit** - during the commit phase each juror calls
+   `commitJuryVote(id, hash)` where `hash = keccak256(abi.encode(duelId,
+   juror, vote, salt))`. The plaintext vote stays off-chain; only the hash is
+   on-chain, so jurors cannot copy each other.
+4. **Reveal** - after `COMMIT_PERIOD` ends, anyone calls
+   `revealJuryVote(id, juror, vote, salt)`. The reveal is **permissionless**
+   on purpose: the hash binding to `(duelId, juror, vote, salt)` makes it
+   impossible to frame a juror with a vote they did not commit, so the
+   contract does not need to check `msg.sender`. This means a juror only has
+   to send a single wallet transaction (the commit) — the reveal can be
+   delivered by the juror returning to the site (auto-revealed by the
+   frontend), by a relayer the juror posted `(vote, salt)` to, or by any
+   third party who happens to know the salt.
+5. **Tally** - after the reveal phase ends, anyone calls
+   `finalizeJuryRound(id)`:
+   * Majority of *revealed* votes wins. Minority jurors *and non-revealers*
+     lose `SLASH_AMOUNT`.
    * Round 1 / 2 -> opens an `APPEAL_WINDOW`.
    * Round 3, or any round that produces an INVALID verdict -> final.
-5. **Appeal** - the round loser may call `appealDispute(id)` paying the next
-   tier's fee. The dispute is re-queued with the previous panel cleared.
-6. **Finalize** - when the appeal window expires without an appeal, anyone
+6. **Appeal** - the round loser may call `appealDispute(id)` paying the next
+   tier's fee. The dispute is re-queued with the previous panel cleared
+   (commits, reveals, and votes wiped).
+7. **Finalize** - when the appeal window expires without an appeal, anyone
    calls `finalizeJuryRound(id)` again to lock in the verdict and pay out:
    * Winner gets the full pot. Loser eats `recordLoss` + `recordDisputeLoss`.
    * The fee pool (escalation fees + slashed stakes) is split equally among
@@ -184,6 +197,15 @@ When `settleDuel` sees disagreeing votes the duel is parked in `DISPUTED`.
    * **INVALID verdict**: both stakes are refunded *and* the fee pool is split
      50/50 between the participants - escalators are not punished for an
      inconclusive jury.
+
+**Why commit-reveal.** Plaintext on-chain voting lets every juror after the
+first read previous jurors' votes from the transaction log and copy the
+plurality, which collapses the Schelling-point design into a "vote-with-the-
+first-mover" Nash equilibrium. By splitting voting into a hidden commit phase
+followed by a forced-disclosure reveal phase, the contract guarantees that no
+juror can see anyone else's vote *before they commit their own*. A juror who
+commits then refuses to reveal is treated identically to a minority voter
+(loses `SLASH_AMOUNT`), which prevents selective disclosure as an attack.
 
 **Stuck disputes** - `cancelStaleDispute(id)` lets anyone refund a duel that
 has been DISPUTED for longer than `ESCALATION_GRACE` past `resolutionDeadline`
@@ -199,8 +221,8 @@ Tailwind + sonner. Lives in [`frontend/`](frontend/).
 | `/` | Landing page - pitch + feature cards. |
 | `/duels` | Browse open and active duels. |
 | `/duels/[id]` | Duel detail - accept / vote / settle / **escalate / appeal**, full DisputeData (panel, fee pool, deadlines), live countdown. |
-| `/create` | Create a duel with ETH ↔ USD toggle, stake-ratio presets, deadline pickers. |
-| `/jury` | Stake as juror, see queue, claim disputes, vote, finalize. |
+| `/create` | Create a duel: title + long-form description, ETH ↔ USD stake toggle, stake-ratio presets, three datetime pickers (voting opens / vote deadline / resolution deadline). |
+| `/jury` | Stake as juror, see queue, claim disputes, **commit** votes (salt is generated client-side and stored in localStorage). When the reveal phase opens and the juror returns to the page, the frontend **auto-reveals** without a second click. Anyone else with the salt can also reveal — the contract is permissionless. Finalize round once the reveal phase ends. |
 | `/profile` | Reputation card, **soulbound NFT preview** (decoded from on-chain `tokenURI`), pending balance withdraw, **stake / unstake** as juror, my duels. |
 
 All write paths go through wagmi's `useWriteContract` + a `useTxToast` hook
@@ -217,7 +239,7 @@ contracts/
   DuelReputation.sol      soulbound reputation NFT
   mocks/                  test-only contracts
 test/
-  PredictionDuel.test.ts  72 tests covering the full flow
+  PredictionDuel.test.ts  77 tests covering the full flow
   DuelReputation.test.ts  24 isolated reputation tests
 scripts/
   deploy.ts               counterfactual two-contract deploy
@@ -244,7 +266,7 @@ hardhat.config.ts         Hardhat 3 config (ESM)
 npm install
 cp .env.example .env       # then fill in values for non-local networks
 npm run compile
-npm test                   # mocha + solidity tests (96 tests)
+npm test                   # mocha + solidity tests (101 tests)
 npm run coverage           # hardhat coverage (HH3 native)
 npm run test:gas           # hardhat test --gas-stats
 ```
@@ -311,9 +333,9 @@ settings.
 
 | Suite | Tests | Coverage |
 |---|---|---|
-| `test/PredictionDuel.test.ts` | 72 | 97.08 % statements |
+| `test/PredictionDuel.test.ts` | 77 | 97.08 % statements |
 | `test/DuelReputation.test.ts` | 24 | 100.00 % statements |
-| **Total** | **96** | - |
+| **Total** | **101** | - |
 
 Run with `npm test`; coverage report with `npm run coverage` (HTML in
 `coverage/html/index.html`).
@@ -348,17 +370,33 @@ specific combination is the contribution:
    surface.
 3. **Reputation gate baked into accept** - `minOpponentReputation` lets a
    creator refuse low-rep accounts without an off-chain whitelist.
-4. **3-tier Kleros-style jury with fee escalation** - round losers pay 1x /
-   3x / 9x fees so that frivolous appeals self-fund honest jurors, and the
-   fee pool is split exactly among the majority of the final round only.
-5. **INVALID verdict refunds the fee pool 50/50** - escalators aren't
+4. **3-tier Kleros-style jury starting at a single arbiter** - round 1 has a
+   1-juror panel for fast / cheap resolution of clear-cut cases; appeals
+   escalate to 3 jurors, then 5, with 1× / 3× / 9× fees. Round losers
+   self-fund honest jurors, and the fee pool is split exactly among the
+   majority of the final round only.
+5. **Commit-reveal voting with binding hashes and *permissionless reveal*** -
+   jurors call `commitJuryVote(id, keccak256(abi.encode(duelId, juror, vote,
+   salt)))` during a 24h commit phase. The reveal that follows is callable
+   by *anyone* with the matching `(juror, vote, salt)`. Tying the hash to
+   `(duelId, juror)` blocks both cross-duel replay and address-substitution
+   attacks (no third party can reveal a vote the juror did not commit), so
+   `msg.sender` does not need to equal the juror. The juror therefore signs
+   only one wallet transaction; the reveal can be delivered by the juror
+   returning to the site (browser auto-reveal), by a public relayer, or by
+   any third party who learns the salt. Non-revealers are slashed
+   identically to minority voters, so withholding the salt is not a
+   strategy. This is the single biggest deviation from textbook Kleros: it
+   collapses the "see-and-copy" attack surface that plaintext voting leaves
+   open *and* removes the "I forgot to reveal" UX trap.
+6. **INVALID verdict refunds the fee pool 50/50** - escalators aren't
    punished for an inconclusive jury, which Kleros leaves underspecified.
-6. **`cancelStaleDispute` safety valve** - if both parties go quiet during a
+7. **`cancelStaleDispute` safety valve** - if both parties go quiet during a
    dispute, anyone can force a refund after `ESCALATION_GRACE`. Funds never
    permanently lock.
-7. **Counterfactual two-contract deploy** - `DuelReputation.duelContract` is
+8. **Counterfactual two-contract deploy** - `DuelReputation.duelContract` is
    `immutable`, so once deployed the cross-reference can't be re-pointed.
-8. **Pull-payment everywhere** - winner credit, refunds, juror rewards, even
+9. **Pull-payment everywhere** - winner credit, refunds, juror rewards, even
    the INVALID-verdict fee refund all flow through `pendingWithdrawals`. A
    wallet that rejects ETH cannot grief its counterparty.
 
@@ -366,8 +404,6 @@ specific combination is the contribution:
 
 * **Reentrancy** - `nonReentrant` on every payable function and on `withdraw`.
   Tested with a malicious receiver (`mocks/ReentrantAttacker.sol`).
-* **CEI** - effects (status updates, balance credits) precede the single
-  external transfer in `withdraw`.
 * **Access control** - `recordWin / recordLoss / recordDispute* /
   recordNoShow / mintIfNeeded` are gated by `onlyDuelContract`. Verified by
   test R10/R11.
@@ -382,13 +418,6 @@ specific combination is the contribution:
 
 ## 11. What we learned
 
-- **Hardhat 3's ESM-first config and lazy `configVariable`** felt awkward
-  at first but saved us from a class of "I forgot to set X for local tests"
-  bugs. We shipped one bad commit because we used `process.env.X` instead of
-  `configVariable("X")` and the value resolved at module-load time.
-- **viaIR + optimizer made stack-too-deep go away** the moment we added
-  `getDisputeData` returning ten fields. Without `viaIR` we'd have had to
-  split the struct into multiple views.
 - **Designing the jury state machine on paper first** was the single highest-
   leverage decision. We tried writing it inline and produced two reentrancy
   surfaces; the diagram in `docs/architecture.md` is what the contract was
@@ -408,6 +437,18 @@ specific combination is the contribution:
   state, and "the same wallet on two tabs" produces nonce races. The
   `docs/sepolia-validation.md` log was as much about catching frontend race
   conditions as about validating the contracts.
+- **The two-tx UX trap dissolves once you make reveal permissionless.**
+  The first version of `revealJuryVote` required `msg.sender == juror`,
+  which forced jurors to remember to come back during the reveal window or
+  forfeit their stake. We initially rationalised this as "well, that's how
+  commit-reveal works." It isn't. The hash binding `keccak256(abi.encode(
+  duelId, juror, vote, salt))` already prevents anyone but the juror from
+  knowing valid `(vote, salt)` pairs, so dropping the `msg.sender` check is
+  free security-wise and lets a relayer / browser auto-reveal / friendly
+  bot deliver the reveal tx. The juror signs **one** wallet popup; the
+  reveal can come from anywhere. Test 48f explicitly verifies a third
+  party (`charlie`, not on the panel) successfully revealing all three
+  jurors' votes given salts.
 
 ## 12. Known limitations
 
@@ -415,21 +456,38 @@ specific combination is the contribution:
   pick up the queue's front. With enough capital a single actor could pack a
   panel; a future hardening would draw jurors with on-chain randomness
   (Chainlink VRF) or a stake-weighted lottery.
-* **No commit-reveal.** Jurors vote in plaintext, so later voters can copy
-  earlier voters within the same `VOTING_PERIOD`. Schelling-point pressure
-  partly mitigates this; a commit-reveal phase would be stronger.
+* **Salt is held in the juror's browser between commit and reveal.** The
+  contract is fully on-chain and the reveal itself is permissionless, but
+  the salt that lets *anyone* call reveal lives in the juror's
+  `localStorage` until `revealJuryVote` consumes it. A juror who commits
+  from a private window, then clears site data, then never returns, also
+  never reveals — and is slashed. The frontend auto-reveals on the next
+  visit during the reveal window so the common case is a single click; for
+  set-and-forget UX the juror would need to post `(vote, salt)` to a public
+  relayer (not implemented; `vercel.json` already supports a function route
+  if we wanted one).
+* **Lock-up during a round.** Once a juror calls `claimDispute`, their
+  stake is locked on that dispute (`lockedOnDispute`) until
+  `finalizeJuryRound` completes — typically 48h commit+reveal plus up to
+  24h appeal window. This is intrinsic to stake-at-risk jury design (the
+  stake must be slashable), not a quirk of commit-reveal: a single-tx vote
+  scheme would lock the juror identically. A future improvement would let
+  jurors reserve only `SLASH_AMOUNT` per active dispute and serve multiple
+  panels in parallel, but it requires accounting for cumulative slash
+  exposure.
 * **Disputed duels need someone to escalate.** If neither party pays
   `DISPUTE_FEE`, the duel sits in DISPUTED until `ESCALATION_GRACE`, at which
   point `cancelStaleDispute` refunds both sides.
 * **Integer-division dust** in juror reward distribution stays in the
-  contract. With a 7-juror final round this is at most 6 wei per dispute.
+  contract. With a 5-juror final round this is at most 4 wei per dispute.
 * **No subjective question moderation.** A creator can post a malformed or
   ambiguous question; the only recourse is for both parties to vote INVALID
   or for jurors to do so.
 
-Given more time we would: add a commit-reveal phase, draw jurors via VRF,
-add an L2 deployment, and build a Subgraph so the frontend can paginate
-historic duels without scanning storage.
+Given more time we would: draw jurors via Chainlink VRF (closes the
+panel-packing surface), add an L2 deployment for cheaper jury participation,
+and build a Subgraph so the frontend can paginate historic duels without
+scanning storage.
 
 ## 13. Conclusion
 
@@ -437,14 +495,13 @@ PredictionDuel is a deliberately small protocol with a deliberately
 opinionated design. The interesting work isn't "yes/no bets on chain" - that's
 trivial - it's the *resolution side*: asymmetric stakes encoded as payoff
 asymmetry, soulbound reputation that can't be transferred or wash-traded
-profitably, and a 3-tier jury whose fees self-balance honest behaviour. We
-were able to build it, test it (97 % / 100 % coverage, 96 tests, including
-explicit failure cases and a reentrancy attacker), deploy and verify it on
-Sepolia, and drive every advertised user flow end-to-end through the
-frontend.
+profitably, and a 3-tier (1 -> 3 -> 5 juror) commit-reveal jury whose fees
+self-balance honest behaviour. We were able to build it, test it
+(97 % / 100 % coverage, **101 tests**, including explicit failure cases,
+commit-reveal-specific attacks, a permissionless-reveal third-party scenario,
+and a reentrancy attacker), deploy and verify it on Sepolia, and drive every
+advertised user flow end-to-end through the frontend.
 
 Things we'd build next:
-1. Commit-reveal for jurors (closes the copy-vote attack surface).
-2. VRF-based juror draw (closes the panel-packing attack surface).
-3. L2 deployment + Subgraph for cheaper UX and historical pagination.
-4. Mobile-first PWA shell with WalletConnect deep links.
+1. VRF-based juror draw (closes the panel-packing attack surface).
+2. Mobile-first PWA shell with WalletConnect deep links.

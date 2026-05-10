@@ -44,7 +44,7 @@ export default function Home() {
           rejects ETH cannot brick the duel.
         </Feature>
         <Feature icon={<Scale className="h-5 w-5" />} title="Jury disputes">
-          Disagreements escalate to a 3 - 5 - 7 juror panel with stake-slashing
+          Disagreements escalate to a 1 - 3 - 5 juror panel with stake-slashing
           minority pressure.
         </Feature>
         <Feature

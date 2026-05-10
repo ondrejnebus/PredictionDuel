@@ -12,6 +12,21 @@ export const predictionDuelAbi = [
   },
   {
     "inputs": [],
+    "name": "AcceptanceWindowClosed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "AlreadyCommitted",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "AlreadyRevealed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "AlreadySettled",
     "type": "error"
   },
@@ -28,6 +43,16 @@ export const predictionDuelAbi = [
   {
     "inputs": [],
     "name": "AppealWindowStillOpen",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "CommitClosed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "CommitPeriodNotOver",
     "type": "error"
   },
   {
@@ -97,6 +122,11 @@ export const predictionDuelAbi = [
   },
   {
     "inputs": [],
+    "name": "InvalidReveal",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "JurorAlreadyLocked",
     "type": "error"
   },
@@ -128,6 +158,11 @@ export const predictionDuelAbi = [
   {
     "inputs": [],
     "name": "NotActiveOrVoting",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotCommitted",
     "type": "error"
   },
   {
@@ -172,6 +207,21 @@ export const predictionDuelAbi = [
   },
   {
     "inputs": [],
+    "name": "RevealClosed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "RevealNotStarted",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "RevealPeriodNotOver",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "TransferFailed",
     "type": "error"
   },
@@ -183,6 +233,11 @@ export const predictionDuelAbi = [
   {
     "inputs": [],
     "name": "VotingClosed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "VotingNotOpenYet",
     "type": "error"
   },
   {
@@ -351,6 +406,12 @@ export const predictionDuelAbi = [
       {
         "indexed": false,
         "internalType": "uint64",
+        "name": "votingStart",
+        "type": "uint64"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint64",
         "name": "voteDeadline",
         "type": "uint64"
       },
@@ -364,6 +425,12 @@ export const predictionDuelAbi = [
         "indexed": false,
         "internalType": "string",
         "name": "question",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "description",
         "type": "string"
       }
     ],
@@ -469,6 +536,56 @@ export const predictionDuelAbi = [
     "inputs": [
       {
         "indexed": true,
+        "internalType": "uint256",
+        "name": "duelId",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "juror",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "bytes32",
+        "name": "commitHash",
+        "type": "bytes32"
+      }
+    ],
+    "name": "JurorCommitted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "duelId",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "juror",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "enum PredictionDuel.Outcome",
+        "name": "vote",
+        "type": "uint8"
+      }
+    ],
+    "name": "JurorRevealed",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
         "internalType": "address",
         "name": "juror",
         "type": "address"
@@ -562,31 +679,6 @@ export const predictionDuelAbi = [
         "type": "uint256"
       },
       {
-        "indexed": true,
-        "internalType": "address",
-        "name": "juror",
-        "type": "address"
-      },
-      {
-        "indexed": false,
-        "internalType": "enum PredictionDuel.Outcome",
-        "name": "vote",
-        "type": "uint8"
-      }
-    ],
-    "name": "JurorVoted",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "duelId",
-        "type": "uint256"
-      },
-      {
         "indexed": false,
         "internalType": "uint8",
         "name": "round",
@@ -667,6 +759,19 @@ export const predictionDuelAbi = [
   },
   {
     "inputs": [],
+    "name": "COMMIT_PERIOD",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "DISPUTE_FEE",
     "outputs": [
       {
@@ -706,7 +811,7 @@ export const predictionDuelAbi = [
   },
   {
     "inputs": [],
-    "name": "SLASH_AMOUNT",
+    "name": "REVEAL_PERIOD",
     "outputs": [
       {
         "internalType": "uint256",
@@ -719,7 +824,7 @@ export const predictionDuelAbi = [
   },
   {
     "inputs": [],
-    "name": "VOTING_PERIOD",
+    "name": "SLASH_AMOUNT",
     "outputs": [
       {
         "internalType": "uint256",
@@ -792,8 +897,65 @@ export const predictionDuelAbi = [
   {
     "inputs": [
       {
+        "internalType": "uint256",
+        "name": "duelId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "commitHash",
+        "type": "bytes32"
+      }
+    ],
+    "name": "commitJuryVote",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "duelId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "juror",
+        "type": "address"
+      },
+      {
+        "internalType": "enum PredictionDuel.Outcome",
+        "name": "vote",
+        "type": "uint8"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "salt",
+        "type": "bytes32"
+      }
+    ],
+    "name": "computeVoteCommit",
+    "outputs": [
+      {
+        "internalType": "bytes32",
+        "name": "",
+        "type": "bytes32"
+      }
+    ],
+    "stateMutability": "pure",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "string",
         "name": "question",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "description",
         "type": "string"
       },
       {
@@ -810,6 +972,11 @@ export const predictionDuelAbi = [
         "internalType": "uint256",
         "name": "minOpponentReputation",
         "type": "uint256"
+      },
+      {
+        "internalType": "uint64",
+        "name": "votingStart",
+        "type": "uint64"
       },
       {
         "internalType": "uint64",
@@ -945,6 +1112,11 @@ export const predictionDuelAbi = [
           },
           {
             "internalType": "uint64",
+            "name": "votingStart",
+            "type": "uint64"
+          },
+          {
+            "internalType": "uint64",
             "name": "voteDeadline",
             "type": "uint64"
           },
@@ -981,6 +1153,11 @@ export const predictionDuelAbi = [
           {
             "internalType": "string",
             "name": "question",
+            "type": "string"
+          },
+          {
+            "internalType": "string",
+            "name": "description",
             "type": "string"
           }
         ],
@@ -1019,7 +1196,12 @@ export const predictionDuelAbi = [
       },
       {
         "internalType": "uint64",
-        "name": "votingDeadline",
+        "name": "commitDeadline",
+        "type": "uint64"
+      },
+      {
+        "internalType": "uint64",
+        "name": "revealDeadline",
         "type": "uint64"
       },
       {
@@ -1113,6 +1295,11 @@ export const predictionDuelAbi = [
           },
           {
             "internalType": "uint64",
+            "name": "votingStart",
+            "type": "uint64"
+          },
+          {
+            "internalType": "uint64",
             "name": "voteDeadline",
             "type": "uint64"
           },
@@ -1149,6 +1336,11 @@ export const predictionDuelAbi = [
           {
             "internalType": "string",
             "name": "question",
+            "type": "string"
+          },
+          {
+            "internalType": "string",
+            "name": "description",
             "type": "string"
           }
         ],
@@ -1239,6 +1431,40 @@ export const predictionDuelAbi = [
   {
     "inputs": [
       {
+        "internalType": "uint256",
+        "name": "duelId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "juror",
+        "type": "address"
+      }
+    ],
+    "name": "getJurorCommitState",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "committed",
+        "type": "bool"
+      },
+      {
+        "internalType": "bool",
+        "name": "revealed",
+        "type": "bool"
+      },
+      {
+        "internalType": "enum PredictionDuel.Outcome",
+        "name": "vote",
+        "type": "uint8"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "address",
         "name": "juror",
         "type": "address"
@@ -1300,24 +1526,6 @@ export const predictionDuelAbi = [
   {
     "inputs": [
       {
-        "internalType": "uint256",
-        "name": "duelId",
-        "type": "uint256"
-      },
-      {
-        "internalType": "enum PredictionDuel.Outcome",
-        "name": "vote",
-        "type": "uint8"
-      }
-    ],
-    "name": "juryVote",
-    "outputs": [],
-    "stateMutability": "nonpayable",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {
         "internalType": "address",
         "name": "",
         "type": "address"
@@ -1345,6 +1553,34 @@ export const predictionDuelAbi = [
       }
     ],
     "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "duelId",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "juror",
+        "type": "address"
+      },
+      {
+        "internalType": "enum PredictionDuel.Outcome",
+        "name": "vote",
+        "type": "uint8"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "salt",
+        "type": "bytes32"
+      }
+    ],
+    "name": "revealJuryVote",
+    "outputs": [],
+    "stateMutability": "nonpayable",
     "type": "function"
   },
   {

@@ -4,11 +4,11 @@ import { duelReputationAbi } from "./abis/duelReputation";
 /// Sepolia deployment (see ../../deployments/sepolia.json).
 export const PREDICTION_DUEL_ADDRESS =
   (process.env.NEXT_PUBLIC_PREDICTION_DUEL_ADDRESS as `0x${string}` | undefined) ??
-  "0x34e27a22f82aCBBEA6672627B3C8c8AF006733C4";
+  "0x251968A3BF080AA888609Aa2114DB9fC017fd84A";
 
 export const DUEL_REPUTATION_ADDRESS =
   (process.env.NEXT_PUBLIC_DUEL_REPUTATION_ADDRESS as `0x${string}` | undefined) ??
-  "0x8E351b767e54CE32dEbd6fBD7d456d50eAEcB595";
+  "0xa7E719C61CC259739B025E07f1785d455f5Bc0b6";
 
 export const predictionDuel = {
   address: PREDICTION_DUEL_ADDRESS,

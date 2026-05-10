@@ -23,6 +23,8 @@ const ETHERSCAN_TX_PREFIX: Record<string, string> = {
 };
 
 const QUESTION = "PredictionDuel smoke test: will this duel settle by deadline?";
+const DESCRIPTION =
+  "Automated smoke test created by scripts/interact.ts. Resolution: settles YES if the deployment harness succeeds.";
 const Outcome = { NONE: 0, YES: 1, NO: 2, INVALID: 3 } as const;
 
 async function main() {
@@ -55,18 +57,22 @@ async function main() {
   const latestBlock = await ethers.provider.getBlock("latest");
   if (!latestBlock) throw new Error("Could not fetch latest block.");
   const now = Number(latestBlock.timestamp);
-  const voteDeadline = BigInt(now + 60 * 60); // 1 hour
-  const resolutionDeadline = BigInt(now + 2 * 60 * 60); // 2 hours
+  const votingStart = BigInt(now + 60 * 60); // 1 hour: voting opens
+  const voteDeadline = BigInt(now + 2 * 60 * 60); // 2 hours: voting closes
+  const resolutionDeadline = BigInt(now + 3 * 60 * 60); // 3 hours
 
   console.log(`Creating duel: stake ${ethers.formatEther(creatorStake)} ETH`);
+  console.log(`  votingStart:         ${votingStart}  (~${new Date(Number(votingStart) * 1000).toISOString()})`);
   console.log(`  voteDeadline:        ${voteDeadline}  (~${new Date(Number(voteDeadline) * 1000).toISOString()})`);
   console.log(`  resolutionDeadline:  ${resolutionDeadline}\n`);
 
   const tx = await duel.createDuel(
     QUESTION,
+    DESCRIPTION,
     Outcome.YES,
     opponentStake,
     noRepGate,
+    votingStart,
     voteDeadline,
     resolutionDeadline,
     { value: creatorStake },
@@ -103,7 +109,9 @@ async function main() {
     console.log(`  creatorStake:   ${ethers.formatEther(stored.creatorStake)} ETH`);
     console.log(`  opponentStake:  ${ethers.formatEther(stored.opponentStake)} ETH`);
     console.log(`  status:         ${stored.status} (0=CREATED)`);
+    console.log(`  votingStart:    ${stored.votingStart}`);
     console.log(`  question:       ${stored.question}`);
+    if (stored.description) console.log(`  description:    ${stored.description}`);
   }
 }
 

@@ -21,7 +21,7 @@ import {DuelReputation} from "./DuelReputation.sol";
 ///         majority verdict stands. Minority jurors lose `SLASH_AMOUNT`
 ///         (Schelling-point incentive). The round loser may appeal within
 ///         `APPEAL_WINDOW`, escalating to a larger panel at 3x / 9x fee.
-///         Maximum three rounds (3-juror -> 5-juror -> 7-juror). After the
+///         Maximum three rounds (1-juror -> 3-juror -> 5-juror). After the
 ///         final round the duel is settled on-chain and reputation updated.
 contract PredictionDuel is ReentrancyGuard {
 
@@ -40,6 +40,10 @@ contract PredictionDuel is ReentrancyGuard {
         uint256 creatorStake;
         uint256 opponentStake;
         uint256 minOpponentReputation;
+        /// @notice Voting opens at this timestamp. Acceptance must happen
+        ///         before this so that no opponent can join after knowing
+        ///         the outcome. submitVote reverts before this timestamp.
+        uint64  votingStart;
         uint64  voteDeadline;
         uint64  resolutionDeadline;
         Status  status;
@@ -47,7 +51,8 @@ contract PredictionDuel is ReentrancyGuard {
         Outcome opponentOutcome;
         Outcome creatorVote;
         Outcome opponentVote;
-        string  question;
+        string  question;     // short title shown in the duel list
+        string  description;  // long-form context (e.g. resolution source URL)
     }
 
     // ------
@@ -67,9 +72,12 @@ contract PredictionDuel is ReentrancyGuard {
         uint8   round;               // current round: 1, 2, or 3
         Outcome lastRoundOutcome;    // set after each round tally
         address[] selectedJurors;
-        mapping(address => Outcome) jurorVotes;
-        mapping(address => bool)    hasVoted;
-        uint64  votingDeadline;
+        mapping(address => bytes32) jurorCommits;   // hash committed during commit phase
+        mapping(address => Outcome) jurorVotes;     // populated on reveal
+        mapping(address => bool)    hasCommitted;
+        mapping(address => bool)    hasRevealed;
+        uint64  commitDeadline;      // commit phase ends at this timestamp
+        uint64  revealDeadline;      // reveal phase ends at this timestamp
         uint64  appealDeadline;      // non-zero while appeal window is open
         address round1Loser;         // duel participant who lost round 1
         address round2Loser;
@@ -104,7 +112,10 @@ contract PredictionDuel is ReentrancyGuard {
     uint256 public constant DISPUTE_FEE    = 0.01 ether;
     uint256 public constant JUROR_STAKE    = 0.05 ether;
     uint256 public constant SLASH_AMOUNT   = 0.02 ether;
-    uint256 public constant VOTING_PERIOD  = 48 hours;
+    /// @notice Commit phase: jurors submit hash(duelId, juror, vote, salt).
+    uint256 public constant COMMIT_PERIOD  = 24 hours;
+    /// @notice Reveal phase: jurors disclose (vote, salt). Total voting = 48h.
+    uint256 public constant REVEAL_PERIOD  = 24 hours;
     uint256 public constant APPEAL_WINDOW  = 24 hours;
     /// @notice Grace period after resolutionDeadline before a DISPUTED duel
     ///         that nobody escalated can be force-refunded by either party.
@@ -122,9 +133,11 @@ contract PredictionDuel is ReentrancyGuard {
         uint256 creatorStake,
         uint256 opponentStake,
         uint256 minOpponentReputation,
+        uint64  votingStart,
         uint64  voteDeadline,
         uint64  resolutionDeadline,
-        string  question
+        string  question,
+        string  description
     );
     event DuelAccepted(uint256 indexed id, address indexed opponent, Outcome opponentOutcome);
     event VoteSubmitted(uint256 indexed id, address indexed voter, Outcome vote);
@@ -139,7 +152,8 @@ contract PredictionDuel is ReentrancyGuard {
     event JurorUnstaked(address indexed juror, uint256 amount);
     event DisputeEscalated(uint256 indexed duelId, uint8 round, address indexed initiator);
     event JurorClaimedDispute(uint256 indexed duelId, address indexed juror, uint8 round);
-    event JurorVoted(uint256 indexed duelId, address indexed juror, Outcome vote);
+    event JurorCommitted(uint256 indexed duelId, address indexed juror, bytes32 commitHash);
+    event JurorRevealed(uint256 indexed duelId, address indexed juror, Outcome vote);
     event RoundResolved(uint256 indexed duelId, uint8 round, Outcome majority, address indexed roundLoser);
     event JurorSlashed(address indexed juror, uint256 indexed duelId, uint256 amount);
     event DisputeFinalized(uint256 indexed duelId, Outcome verdict);
@@ -153,6 +167,8 @@ contract PredictionDuel is ReentrancyGuard {
     error InvalidDeadlines();
     error ZeroStake();
     error EmptyQuestion();
+    error AcceptanceWindowClosed();
+    error VotingNotOpenYet();
     error DuelNotFound();
     error NotCreatedStatus();
     error NotActiveOrVoting();
@@ -182,6 +198,15 @@ contract PredictionDuel is ReentrancyGuard {
     error VotingPeriodNotOver();
     error NotAJuror();
     error DisputeAlreadyFinalized();
+    error CommitClosed();
+    error RevealNotStarted();
+    error RevealClosed();
+    error AlreadyCommitted();
+    error NotCommitted();
+    error AlreadyRevealed();
+    error InvalidReveal();
+    error CommitPeriodNotOver();
+    error RevealPeriodNotOver();
     error NoAppealWindow();
     error AppealWindowStillOpen();
     error AppealWindowExpired();
@@ -206,18 +231,29 @@ contract PredictionDuel is ReentrancyGuard {
     // ------
 
     /// @notice Create a duel with asymmetric stakes.
+    /// @param question        short title (required)
+    /// @param description     long-form context (optional, may be empty)
+    /// @param creatorOutcome  the side the creator is betting on (YES or NO)
+    /// @param opponentStake   ETH the opponent must match in `acceptDuel`
+    /// @param minOpponentReputation  rep gate; opponent must have >= this
+    /// @param votingStart     timestamp when voting opens (must be > now)
+    /// @param voteDeadline    timestamp when voting closes (> votingStart)
+    /// @param resolutionDeadline  timestamp after which no-show paths apply
     function createDuel(
-        string calldata question,
+        string  calldata question,
+        string  calldata description,
         Outcome creatorOutcome,
         uint256 opponentStake,
         uint256 minOpponentReputation,
+        uint64  votingStart,
         uint64  voteDeadline,
         uint64  resolutionDeadline
     ) external payable nonReentrant returns (uint256 id) {
         if (msg.value == 0 || opponentStake == 0) revert ZeroStake();
         if (creatorOutcome != Outcome.YES && creatorOutcome != Outcome.NO) revert InvalidOutcome();
         if (bytes(question).length == 0) revert EmptyQuestion();
-        if (voteDeadline <= block.timestamp) revert InvalidDeadlines();
+        if (votingStart <= block.timestamp) revert InvalidDeadlines();
+        if (voteDeadline <= votingStart) revert InvalidDeadlines();
         if (resolutionDeadline <= voteDeadline) revert InvalidDeadlines();
 
         unchecked { id = ++duelCounter; }
@@ -228,29 +264,34 @@ contract PredictionDuel is ReentrancyGuard {
         d.creatorStake          = msg.value;
         d.opponentStake         = opponentStake;
         d.minOpponentReputation = minOpponentReputation;
+        d.votingStart           = votingStart;
         d.voteDeadline          = voteDeadline;
         d.resolutionDeadline    = resolutionDeadline;
         d.status                = Status.CREATED;
         d.creatorOutcome        = creatorOutcome;
         d.question              = question;
+        d.description           = description;
 
         _userDuels[msg.sender].push(id);
 
         emit DuelCreated(
             id, msg.sender, creatorOutcome,
             msg.value, opponentStake, minOpponentReputation,
-            voteDeadline, resolutionDeadline, question
+            votingStart, voteDeadline, resolutionDeadline,
+            question, description
         );
     }
 
     /// @notice Accept an open duel. Must send exactly `opponentStake` ETH.
+    /// @dev    Must be called before `votingStart` so the opponent cannot
+    ///         join after the event is already known.
     function acceptDuel(uint256 id) external payable nonReentrant {
         Duel storage d = _duels[id];
         if (d.creator == address(0)) revert DuelNotFound();
         if (d.status != Status.CREATED) revert NotCreatedStatus();
         if (msg.sender == d.creator) revert CreatorCannotAccept();
         if (msg.value != d.opponentStake) revert WrongStakeAmount();
-        if (block.timestamp >= d.voteDeadline) revert VotingClosed();
+        if (block.timestamp >= d.votingStart) revert AcceptanceWindowClosed();
 
         if (d.minOpponentReputation > 0) {
             int256 oppScore = reputation.reputationScore(msg.sender);
@@ -270,12 +311,14 @@ contract PredictionDuel is ReentrancyGuard {
     }
 
     /// @notice Submit your vote on what actually happened.
+    /// @dev    Voting window is `[votingStart, voteDeadline)`.
     function submitVote(uint256 id, Outcome vote) external {
         if (vote == Outcome.NONE) revert InvalidOutcome();
 
         Duel storage d = _duels[id];
         if (d.creator == address(0)) revert DuelNotFound();
         if (d.status != Status.ACTIVE && d.status != Status.VOTING) revert NotActiveOrVoting();
+        if (block.timestamp < d.votingStart) revert VotingNotOpenYet();
         if (block.timestamp >= d.voteDeadline) revert VotingClosed();
 
         bool isCreator  = msg.sender == d.creator;
@@ -459,22 +502,35 @@ contract PredictionDuel is ReentrancyGuard {
 
         if (uint8(dd.selectedJurors.length) == _jurorCountForRound(dd.round)) {
             unchecked { _queueHead++; }
-            dd.votingDeadline = uint64(block.timestamp + VOTING_PERIOD);
+            dd.commitDeadline = uint64(block.timestamp + COMMIT_PERIOD);
+            dd.revealDeadline = uint64(block.timestamp + COMMIT_PERIOD + REVEAL_PERIOD);
         }
     }
 
     // ------
-    // Phase-5: Voting
+    // Phase-5: Commit-reveal voting
     // ------
 
-    /// @notice Cast a jury vote. Only callable by assigned jurors during the
-    ///         voting window.
-    function juryVote(uint256 duelId, Outcome vote) external {
-        if (vote == Outcome.NONE) revert InvalidOutcome();
+    /// @notice Hash that jurors commit during the commit phase. Binding the
+    ///         hash to `(duelId, juror)` prevents replay across duels and
+    ///         disallows another address committing the same hash.
+    /// @dev    Helper exposed for off-chain tooling so it cannot drift from
+    ///         on-chain semantics.
+    function computeVoteCommit(
+        uint256 duelId,
+        address juror,
+        Outcome vote,
+        bytes32 salt
+    ) public pure returns (bytes32) {
+        return keccak256(abi.encode(duelId, juror, vote, salt));
+    }
+
+    /// @notice Commit a hidden jury vote during the commit phase.
+    function commitJuryVote(uint256 duelId, bytes32 commitHash) external {
         DisputeData storage dd = _disputes[duelId];
-        if (dd.votingDeadline == 0) revert VotingNotStarted();
-        if (block.timestamp >= dd.votingDeadline) revert VotingClosed();
-        if (dd.hasVoted[msg.sender]) revert AlreadyVoted();
+        if (dd.commitDeadline == 0) revert VotingNotStarted();
+        if (block.timestamp >= dd.commitDeadline) revert CommitClosed();
+        if (dd.hasCommitted[msg.sender]) revert AlreadyCommitted();
 
         bool isJuror;
         uint256 len = dd.selectedJurors.length;
@@ -484,9 +540,46 @@ contract PredictionDuel is ReentrancyGuard {
         }
         if (!isJuror) revert NotAJuror();
 
-        dd.jurorVotes[msg.sender] = vote;
-        dd.hasVoted[msg.sender]   = true;
-        emit JurorVoted(duelId, msg.sender, vote);
+        dd.jurorCommits[msg.sender] = commitHash;
+        dd.hasCommitted[msg.sender] = true;
+        emit JurorCommitted(duelId, msg.sender, commitHash);
+    }
+
+    /// @notice Reveal a previously committed vote during the reveal phase.
+    ///         Permissionless: anyone can submit a reveal on a juror's behalf
+    ///         provided they know the matching `(vote, salt)`. The hash binds
+    ///         to `(duelId, juror, vote, salt)` so a third party cannot frame
+    ///         a juror with a vote the juror did not commit.
+    /// @dev    Permissionless reveal lets the juror's wallet submit only one
+    ///         transaction (the commit). The reveal can be delivered by:
+    ///           - the juror themselves on a return visit;
+    ///           - the frontend auto-revealing when the tab is open in the
+    ///             reveal window and the salt is in localStorage;
+    ///           - a public keeper / relayer that the juror posted
+    ///             `(vote, salt)` to after committing.
+    ///         Reveal is only valid after the commit phase has ended; this
+    ///         prevents a juror from copying another juror's revealed vote
+    ///         before committing their own.
+    function revealJuryVote(
+        uint256 duelId,
+        address juror,
+        Outcome vote,
+        bytes32 salt
+    ) external {
+        if (vote == Outcome.NONE) revert InvalidOutcome();
+        DisputeData storage dd = _disputes[duelId];
+        if (dd.commitDeadline == 0) revert VotingNotStarted();
+        if (block.timestamp < dd.commitDeadline) revert RevealNotStarted();
+        if (block.timestamp >= dd.revealDeadline) revert RevealClosed();
+        if (!dd.hasCommitted[juror]) revert NotCommitted();
+        if (dd.hasRevealed[juror]) revert AlreadyRevealed();
+
+        bytes32 expected = computeVoteCommit(duelId, juror, vote, salt);
+        if (dd.jurorCommits[juror] != expected) revert InvalidReveal();
+
+        dd.jurorVotes[juror] = vote;
+        dd.hasRevealed[juror] = true;
+        emit JurorRevealed(duelId, juror, vote);
     }
 
     // ------
@@ -508,31 +601,41 @@ contract PredictionDuel is ReentrancyGuard {
             return;
         }
 
-        if (dd.votingDeadline == 0) revert VotingNotStarted();
-        if (block.timestamp < dd.votingDeadline) revert VotingPeriodNotOver();
+        if (dd.commitDeadline == 0) revert VotingNotStarted();
+        if (block.timestamp < dd.revealDeadline) revert RevealPeriodNotOver();
 
-        // Tally votes
+        // Tally only revealed votes. Non-revealers contribute nothing to the
+        // majority and are slashed below.
         uint256 yesVotes;
         uint256 noVotes;
         uint256 panelLen = dd.selectedJurors.length;
         for (uint256 i; i < panelLen; ) {
-            Outcome v = dd.jurorVotes[dd.selectedJurors[i]];
-            if (v == Outcome.YES)     { unchecked { ++yesVotes; } }
-            else if (v == Outcome.NO) { unchecked { ++noVotes;  } }
+            address jurorAddr = dd.selectedJurors[i];
+            if (dd.hasRevealed[jurorAddr]) {
+                Outcome v = dd.jurorVotes[jurorAddr];
+                if (v == Outcome.YES)     { unchecked { ++yesVotes; } }
+                else if (v == Outcome.NO) { unchecked { ++noVotes;  } }
+            }
             unchecked { ++i; }
         }
 
         Outcome majority;
         if      (yesVotes > noVotes) majority = Outcome.YES;
         else if (noVotes > yesVotes) majority = Outcome.NO;
-        else                         majority = Outcome.INVALID; // tie
+        else                         majority = Outcome.INVALID; // tie or no reveals
 
-        // Slash minority jurors and free all panel members
+        // Slash both minority jurors and non-revealers. A juror who skipped
+        // commit-reveal is treated as a no-show juror and pays SLASH_AMOUNT,
+        // funding the honest majority just like a wrong vote does.
         uint256 slashAccum;
         for (uint256 i; i < panelLen; ) {
             address jurorAddr = dd.selectedJurors[i];
             Juror storage jj  = _jurors[jurorAddr];
-            if (dd.jurorVotes[jurorAddr] != majority) {
+            bool revealed = dd.hasRevealed[jurorAddr];
+            bool slashThis =
+                !revealed ||
+                dd.jurorVotes[jurorAddr] != majority;
+            if (slashThis) {
                 uint256 slash = jj.stake < SLASH_AMOUNT ? jj.stake : SLASH_AMOUNT;
                 unchecked { jj.stake -= slash; slashAccum += slash; }
                 if (jj.stake < JUROR_STAKE) jj.isActive = false;
@@ -585,14 +688,17 @@ contract PredictionDuel is ReentrancyGuard {
         uint256 len = dd.selectedJurors.length;
         for (uint256 i; i < len; ) {
             address jurorAddr = dd.selectedJurors[i];
+            delete dd.jurorCommits[jurorAddr];
             delete dd.jurorVotes[jurorAddr];
-            delete dd.hasVoted[jurorAddr];
+            delete dd.hasCommitted[jurorAddr];
+            delete dd.hasRevealed[jurorAddr];
             unchecked { ++i; }
         }
         delete dd.selectedJurors;
 
-        dd.round         = nextRound;
-        dd.votingDeadline  = 0;
+        dd.round           = nextRound;
+        dd.commitDeadline  = 0;
+        dd.revealDeadline  = 0;
         dd.appealDeadline  = 0;
         unchecked { dd.feePool += msg.value; }
 
@@ -659,7 +765,8 @@ contract PredictionDuel is ReentrancyGuard {
         uint8   round,
         Outcome lastRoundOutcome,
         address[] memory selectedJurors,
-        uint64  votingDeadline,
+        uint64  commitDeadline,
+        uint64  revealDeadline,
         uint64  appealDeadline,
         address round1Loser,
         address round2Loser,
@@ -670,10 +777,20 @@ contract PredictionDuel is ReentrancyGuard {
         DisputeData storage dd = _disputes[duelId];
         return (
             dd.round, dd.lastRoundOutcome, dd.selectedJurors,
-            dd.votingDeadline, dd.appealDeadline,
+            dd.commitDeadline, dd.revealDeadline, dd.appealDeadline,
             dd.round1Loser, dd.round2Loser,
             dd.feePool, dd.initialized, dd.finalized
         );
+    }
+
+    /// @notice Look up a juror's commit-reveal state for a dispute.
+    function getJurorCommitState(uint256 duelId, address juror)
+        external view returns (bool committed, bool revealed, Outcome vote)
+    {
+        DisputeData storage dd = _disputes[duelId];
+        committed = dd.hasCommitted[juror];
+        revealed  = dd.hasRevealed[juror];
+        vote      = dd.jurorVotes[juror];
     }
 
     function getJurorInfo(address juror) external view returns (
@@ -810,9 +927,9 @@ contract PredictionDuel is ReentrancyGuard {
     }
 
     function _jurorCountForRound(uint8 round) private pure returns (uint8) {
-        if (round == 1) return 3;
-        if (round == 2) return 5;
-        return 7;
+        if (round == 1) return 1; // fast single-arbiter for low-stakes / clear cases
+        if (round == 2) return 3;
+        return 5;
     }
 
     function _feeForRound(uint8 round) private pure returns (uint256) {

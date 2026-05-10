@@ -15,6 +15,8 @@ const Status = {
 } as const;
 
 const QUESTION = "Will BTC be below $50k on Dec 31 2026?";
+const DESCRIPTION =
+  "Resolves YES if BTC/USD spot on Coinbase at 23:59 UTC Dec 31 2026 < $50,000.";
 const CREATOR_STAKE = ethers.parseEther("0.8");
 const OPPONENT_STAKE = ethers.parseEther("0.2");
 
@@ -44,8 +46,12 @@ async function deployFixture() {
   }
 
   const now = await time.latest();
-  const voteDeadline = now + 3600;
-  const resolutionDeadline = now + 7200;
+  // votingStart 1h after now, voteDeadline 2h, resolutionDeadline 3h.
+  // Acceptance window is [now, votingStart). Voting window is
+  // [votingStart, voteDeadline). After voteDeadline anyone can settleDuel.
+  const votingStart = now + 3600;
+  const voteDeadline = now + 7200;
+  const resolutionDeadline = now + 10800;
 
   return {
     contract,
@@ -54,6 +60,7 @@ async function deployFixture() {
     alice,
     bob,
     charlie,
+    votingStart,
     voteDeadline,
     resolutionDeadline,
     creatorStake: CREATOR_STAKE,
@@ -63,22 +70,73 @@ async function deployFixture() {
 
 async function activeDuelFixture() {
   const base = await deployFixture();
-  const { contract, alice, bob, voteDeadline, resolutionDeadline, creatorStake, opponentStake } = base;
+  const {
+    contract, alice, bob,
+    votingStart, voteDeadline, resolutionDeadline,
+    creatorStake, opponentStake,
+  } = base;
 
   await contract
     .connect(alice)
     .createDuel(
       QUESTION,
+      DESCRIPTION,
       Outcome.YES,
       opponentStake,
       NO_REP_GATE,
+      votingStart,
       voteDeadline,
       resolutionDeadline,
       { value: creatorStake },
     );
   await contract.connect(bob).acceptDuel(1, { value: opponentStake });
 
+  // Advance into the voting window so submitVote() works in subsequent steps.
+  await time.increaseTo(votingStart);
+
   return { ...base, duelId: 1n };
+}
+
+// ---- Commit-reveal helpers ----
+// Tests use a deterministic salt (juror index) so failures are reproducible.
+// `castJuryPanel` performs commit -> advance to reveal phase -> reveal for
+// every juror, so a single helper call replaces the old `juryVote` flow.
+type Voter = { juror: any; vote: number };
+
+function jurorSalt(idx: number): string {
+  // 32-byte salt: leading 31 bytes zero, last byte = idx + 1.
+  const hex = (idx + 1).toString(16).padStart(2, "0");
+  return "0x" + "00".repeat(31) + hex;
+}
+
+async function commitVote(contract: any, duelId: bigint, voter: Voter, idx: number) {
+  const salt = jurorSalt(idx);
+  const hash = await contract.computeVoteCommit(
+    duelId,
+    voter.juror.address,
+    voter.vote,
+    salt,
+  );
+  await contract.connect(voter.juror).commitJuryVote(duelId, hash);
+  return salt;
+}
+
+async function castJuryPanel(contract: any, duelId: bigint, voters: Voter[]) {
+  const salts: string[] = [];
+  for (let i = 0; i < voters.length; i++) {
+    salts.push(await commitVote(contract, duelId, voters[i], i));
+  }
+  const dd = await contract.getDisputeData(duelId);
+  await time.increaseTo(Number(dd.commitDeadline));
+  for (let i = 0; i < voters.length; i++) {
+    // Reveal is permissionless: pass the juror as an explicit param.
+    // Tests call it from the juror's own signer for parity with the old flow,
+    // but any signer would work as long as (vote, salt) match the commit.
+    await contract
+      .connect(voters[i].juror)
+      .revealJuryVote(duelId, voters[i].juror.address, voters[i].vote, salts[i]);
+  }
+  return salts;
 }
 
 describe("PredictionDuel", function () {
@@ -99,14 +157,14 @@ describe("PredictionDuel", function () {
     });
 
     it("2. Should create a duel with correct parameters", async function () {
-      const { contract, alice, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
+      const { contract, alice, votingStart, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
         await loadFixture(deployFixture);
 
       const contractAddr = await contract.getAddress();
 
       const tx = contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE, votingStart, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -119,9 +177,11 @@ describe("PredictionDuel", function () {
           creatorStake,
           opponentStake,
           NO_REP_GATE,
+          votingStart,
           voteDeadline,
           resolutionDeadline,
           QUESTION,
+          DESCRIPTION,
         );
       await expect(tx).to.changeEtherBalances(ethers,
         [alice, contractAddr],
@@ -138,6 +198,8 @@ describe("PredictionDuel", function () {
       expect(d.creatorOutcome).to.equal(Outcome.YES);
       expect(d.status).to.equal(Status.CREATED);
       expect(d.question).to.equal(QUESTION);
+      expect(d.description).to.equal(DESCRIPTION);
+      expect(d.votingStart).to.equal(votingStart);
 
       expect(await contract.getUserDuels(alice.address)).to.deep.equal([1n]);
     });
@@ -145,12 +207,12 @@ describe("PredictionDuel", function () {
 
   describe("Acceptance", function () {
     it("3. Should let opponent accept duel and lock both stakes", async function () {
-      const { contract, alice, bob, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
+      const { contract, alice, bob, votingStart, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
         await loadFixture(deployFixture);
 
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE, votingStart, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -279,25 +341,25 @@ describe("PredictionDuel", function () {
 
   describe("Edge cases", function () {
     it("8. Should revert when creator stakes 0 ETH", async function () {
-      const { contract, alice, voteDeadline, resolutionDeadline, opponentStake } =
+      const { contract, alice, votingStart, voteDeadline, resolutionDeadline, opponentStake } =
         await loadFixture(deployFixture);
 
       await expect(
         contract
           .connect(alice)
-          .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
+          .createDuel(QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE, votingStart, voteDeadline, resolutionDeadline, {
             value: 0,
           }),
       ).to.be.revertedWithCustomError(contract, "ZeroStake");
     });
 
     it("9. Should revert when opponent sends wrong stake amount", async function () {
-      const { contract, alice, bob, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
+      const { contract, alice, bob, votingStart, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
         await loadFixture(deployFixture);
 
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE, votingStart, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -311,12 +373,12 @@ describe("PredictionDuel", function () {
     });
 
     it("10. Should revert when same address tries to accept own duel", async function () {
-      const { contract, alice, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
+      const { contract, alice, votingStart, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
         await loadFixture(deployFixture);
 
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE, votingStart, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -334,12 +396,12 @@ describe("PredictionDuel", function () {
     });
 
     it("12. Should revert when voting before duel is accepted", async function () {
-      const { contract, alice, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
+      const { contract, alice, votingStart, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
         await loadFixture(deployFixture);
 
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE, votingStart, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -435,12 +497,12 @@ describe("PredictionDuel", function () {
     });
 
     it("19. Should let creator cancel an unaccepted duel and recover stake", async function () {
-      const { contract, alice, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
+      const { contract, alice, votingStart, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
         await loadFixture(deployFixture);
 
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE, votingStart, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
@@ -501,7 +563,7 @@ describe("PredictionDuel", function () {
 
   describe("Security", function () {
     it("22. Should be protected against reentrancy on withdraw()", async function () {
-      const { contract, alice, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
+      const { contract, alice, votingStart, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
         await loadFixture(deployFixture);
 
       const Attacker = await ethers.getContractFactory("ReentrantAttacker");
@@ -512,11 +574,14 @@ describe("PredictionDuel", function () {
       // Alice (creator, YES) vs Attacker (opponent, NO).
       await contract
         .connect(alice)
-        .createDuel(QUESTION, Outcome.YES, opponentStake, NO_REP_GATE, voteDeadline, resolutionDeadline, {
+        .createDuel(QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE, votingStart, voteDeadline, resolutionDeadline, {
           value: creatorStake,
         });
 
       await attacker.joinDuel(1, opponentStake);
+
+      // Advance into the voting window before submitting votes.
+      await time.increaseTo(votingStart);
 
       // Both vote NO so the attacker wins the pot and gets credited.
       await contract.connect(alice).submitVote(1, Outcome.NO);
@@ -696,6 +761,7 @@ describe("PredictionDuel", function () {
         contract,
         alice,
         bob,
+        votingStart,
         voteDeadline,
         resolutionDeadline,
         creatorStake,
@@ -706,9 +772,11 @@ describe("PredictionDuel", function () {
         .connect(alice)
         .createDuel(
           QUESTION,
+          DESCRIPTION,
           Outcome.YES,
           opponentStake,
           5n, // require score >= 5
+          votingStart,
           voteDeadline,
           resolutionDeadline,
           { value: creatorStake },
@@ -726,20 +794,24 @@ describe("PredictionDuel", function () {
 
       // Round 1: bob beats charlie in an ungated duel to earn score (>= 5).
       const t0 = await time.latest();
+      const vs1 = t0 + 300;
       const vd1 = t0 + 600;
       const rd1 = t0 + 1200;
       await contract
         .connect(bob)
         .createDuel(
           QUESTION,
+          DESCRIPTION,
           Outcome.YES,
           opponentStake,
           NO_REP_GATE,
+          vs1,
           vd1,
           rd1,
           { value: creatorStake },
         );
       await contract.connect(charlie).acceptDuel(1, { value: opponentStake });
+      await time.increaseTo(vs1);
       await contract.connect(bob).submitVote(1, Outcome.YES);
       await contract.connect(charlie).submitVote(1, Outcome.YES);
       await time.increaseTo(vd1);
@@ -748,15 +820,18 @@ describe("PredictionDuel", function () {
       // Bob now has 11 win points from a 0.8 ETH stake.
       // Round 2: alice creates a gated duel; bob can accept.
       const t1 = await time.latest();
+      const vs2 = t1 + 300;
       const vd2 = t1 + 600;
       const rd2 = t1 + 1200;
       await contract
         .connect(alice)
         .createDuel(
           QUESTION,
+          DESCRIPTION,
           Outcome.YES,
           opponentStake,
           5n,
+          vs2,
           vd2,
           rd2,
           { value: creatorStake },
@@ -853,9 +928,11 @@ describe("PredictionDuel", function () {
 
     await contract
       .connect(alice)
-      .createDuel(QUESTION, Outcome.YES, base.opponentStake, NO_REP_GATE,
-        base.voteDeadline, base.resolutionDeadline, { value: base.creatorStake });
+      .createDuel(QUESTION, DESCRIPTION, Outcome.YES, base.opponentStake, NO_REP_GATE,
+        base.votingStart, base.voteDeadline, base.resolutionDeadline,
+        { value: base.creatorStake });
     await contract.connect(bob).acceptDuel(1, { value: base.opponentStake });
+    await time.increaseTo(base.votingStart);
     await contract.connect(alice).submitVote(1, Outcome.YES);
     await contract.connect(bob).submitVote(1, Outcome.NO);
     await time.increaseTo(base.voteDeadline);
@@ -964,68 +1041,106 @@ describe("PredictionDuel", function () {
         .to.be.revertedWithCustomError(contract, "JurorIsParticipant");
     });
 
-    it("43. Should start voting once the 3-juror panel is complete", async function () {
+    it("43. Should start voting once the 1-juror round-1 panel is complete", async function () {
       const { contract, alice, duelId } = await loadFixture(disputedDuelFixture);
       await contract.connect(alice).escalateToJury(duelId, { value: ethers.parseEther("0.01") });
-      const jurors = await stakeJurors(contract, 3);
+      expect(await contract.getDisputeQueueLength()).to.equal(1n);
 
-      for (const j of jurors.slice(0, 2)) {
-        await contract.connect(j).claimDispute();
-        // Queue head must not advance until panel is full
-        expect(await contract.getDisputeQueueLength()).to.equal(1n);
-      }
-      await contract.connect(jurors[2]).claimDispute();
+      const [j1] = await stakeJurors(contract, 1);
+      await contract.connect(j1).claimDispute();
 
-      // Panel complete - queue consumed
+      // Panel complete (round 1 = 1 juror) - queue consumed.
       expect(await contract.getDisputeQueueLength()).to.equal(0n);
       const data = await contract.getDisputeData(duelId);
-      expect(data.votingDeadline).to.be.gt(0n);
-      expect(data.selectedJurors.length).to.equal(3);
+      expect(data.commitDeadline).to.be.gt(0n);
+      expect(data.revealDeadline).to.be.gt(data.commitDeadline);
+      expect(data.selectedJurors.length).to.equal(1);
     });
   });
 
   describe("Phase 5: Voting & round finalization", function () {
-    // Fixture: 3-juror panel assembled on duel 1, voting open.
+    // Fixture: 1-juror round 1 panel assembled on duel 1, commit phase open.
     async function panelReadyFixture() {
       const base = await disputedDuelFixture();
       const { contract, alice, duelId } = base;
       await contract.connect(alice).escalateToJury(duelId, { value: ethers.parseEther("0.01") });
-      const jurors = await stakeJurors(contract, 3);
-      for (const j of jurors) await contract.connect(j).claimDispute();
+      const jurors = await stakeJurors(contract, 1);
+      await contract.connect(jurors[0]).claimDispute();
       return { ...base, jurors };
     }
 
-    it("44. Should revert vote from a non-juror", async function () {
+    // Fixture: round 1 (1 juror) resolved YES (alice wins, bob is round1Loser),
+    // bob appeals to round 2, 3 jurors claim and the round 2 commit phase is open.
+    // Used by tests that need a multi-juror panel (minority slash, tie, NO majority,
+    // permissionless reveal across multiple jurors, ...).
+    async function panelReadyR2Fixture() {
+      const base = await disputedDuelFixture();
+      const { contract, alice, bob, duelId } = base;
+      const signers = await ethers.getSigners();
+
+      // Round 1: 1 juror, votes YES so alice wins.
+      await contract.connect(alice).escalateToJury(duelId, { value: ethers.parseEther("0.01") });
+      const r1Juror = signers[4];
+      await contract.connect(r1Juror).stakeAsJuror({ value: ethers.parseEther("0.1") });
+      await contract.connect(r1Juror).claimDispute();
+      await castJuryPanel(contract, duelId, [{ juror: r1Juror, vote: Outcome.YES }]);
+      let dd = await contract.getDisputeData(duelId);
+      await time.increaseTo(Number(dd.revealDeadline));
+      await contract.finalizeJuryRound(duelId); // tally round 1 -> opens appeal
+
+      // bob is round1Loser; bob appeals to round 2 (3 jurors, 3x fee).
+      await contract.connect(bob).appealDispute(duelId, { value: ethers.parseEther("0.03") });
+
+      // Round 2: 3 fresh jurors claim.
+      const jurors = signers.slice(5, 8);
+      for (const j of jurors) {
+        await contract.connect(j).stakeAsJuror({ value: ethers.parseEther("0.1") });
+      }
+      for (const j of jurors) await contract.connect(j).claimDispute();
+      return { ...base, jurors, r1Juror };
+    }
+
+    it("44. Should revert commit from a non-juror", async function () {
       const { contract, charlie, duelId } = await loadFixture(panelReadyFixture);
-      await expect(contract.connect(charlie).juryVote(duelId, Outcome.YES))
+      const fakeHash = await contract.computeVoteCommit(
+        duelId,
+        charlie.address,
+        Outcome.YES,
+        jurorSalt(0),
+      );
+      await expect(contract.connect(charlie).commitJuryVote(duelId, fakeHash))
         .to.be.revertedWithCustomError(contract, "NotAJuror");
     });
 
-    it("45. Should revert double-vote from same juror", async function () {
+    it("45. Should revert double-commit from same juror", async function () {
       const { contract, duelId, jurors } = await loadFixture(panelReadyFixture);
-      await contract.connect(jurors[0]).juryVote(duelId, Outcome.YES);
-      await expect(contract.connect(jurors[0]).juryVote(duelId, Outcome.YES))
-        .to.be.revertedWithCustomError(contract, "AlreadyVoted");
+      await commitVote(contract, duelId, { juror: jurors[0], vote: Outcome.YES }, 0);
+      const sameHash = await contract.computeVoteCommit(
+        duelId,
+        jurors[0].address,
+        Outcome.YES,
+        jurorSalt(0),
+      );
+      await expect(contract.connect(jurors[0]).commitJuryVote(duelId, sameHash))
+        .to.be.revertedWithCustomError(contract, "AlreadyCommitted");
     });
 
-    it("46. Full round 1: majority YES -> appeal window -> finalization on second call", async function () {
+    it("46. Full round 1 (1 juror) -> appeal window -> finalization on second call", async function () {
       const { contract, reputation, alice, bob, duelId, jurors, creatorStake, opponentStake } =
         await loadFixture(panelReadyFixture);
 
-      // 2-1 majority for YES (alice bet YES and wins)
-      await contract.connect(jurors[0]).juryVote(duelId, Outcome.YES);
-      await contract.connect(jurors[1]).juryVote(duelId, Outcome.YES);
-      await contract.connect(jurors[2]).juryVote(duelId, Outcome.NO);
+      // Round 1 has 1 juror -> any vote IS the majority. Vote YES so alice
+      // (bet YES) is the round winner and bob is round1Loser.
+      await castJuryPanel(contract, duelId, [{ juror: jurors[0], vote: Outcome.YES }]);
 
       const data = await contract.getDisputeData(duelId);
-      await time.increaseTo(Number(data.votingDeadline));
+      await time.increaseTo(Number(data.revealDeadline));
 
-      // First call: tally votes, slash minority, open APPEAL_WINDOW (bob is round loser).
+      // First call: tally, no slashing (1 juror, no minority), open APPEAL_WINDOW.
       await expect(contract.finalizeJuryRound(duelId))
-        .to.emit(contract, "RoundResolved").withArgs(duelId, 1, Outcome.YES, bob.address)
-        .and.to.emit(contract, "JurorSlashed");
+        .to.emit(contract, "RoundResolved").withArgs(duelId, 1, Outcome.YES, bob.address);
 
-      // Duel is not yet settled - appeal window is open.
+      // No minority -> no JurorSlashed event in round 1.
       expect((await contract.getDuel(duelId)).status).to.equal(Status.DISPUTED);
 
       // Advance past appeal window without bob appealing.
@@ -1042,23 +1157,31 @@ describe("PredictionDuel", function () {
       expect(await contract.pendingWithdrawals(bob.address)).to.equal(0n);
       expect((await contract.getDuel(duelId)).status).to.equal(Status.SETTLED);
 
+      // Round-1 sole juror gets the entire fee pool (0.01 ETH escalation).
+      expect(await contract.pendingWithdrawals(jurors[0].address))
+        .to.equal(ethers.parseEther("0.01"));
+
       // Reputation recorded on final settlement.
       expect((await reputation.getReputation(alice.address)).disputesWon).to.equal(1n);
       expect((await reputation.getReputation(bob.address)).disputesLost).to.equal(1n);
     });
 
-    it("47. Minority juror slashed after round; majority jurors share fee pool on finalization", async function () {
-      const { contract, duelId, jurors } = await loadFixture(panelReadyFixture);
+    it("47. Minority juror slashed in round 2; majority share the fee pool on finalization", async function () {
+      // Round 2 has 3 jurors, so a 2-1 majority is meaningful.
+      const { contract, duelId, jurors } = await loadFixture(panelReadyR2Fixture);
 
-      await contract.connect(jurors[0]).juryVote(duelId, Outcome.YES);
-      await contract.connect(jurors[1]).juryVote(duelId, Outcome.YES);
-      await contract.connect(jurors[2]).juryVote(duelId, Outcome.NO);
+      // Round 2: 2 vote YES, 1 votes NO.
+      await castJuryPanel(contract, duelId, [
+        { juror: jurors[0], vote: Outcome.YES },
+        { juror: jurors[1], vote: Outcome.YES },
+        { juror: jurors[2], vote: Outcome.NO  },
+      ]);
 
       const data = await contract.getDisputeData(duelId);
-      await time.increaseTo(Number(data.votingDeadline));
+      await time.increaseTo(Number(data.revealDeadline));
 
       const minorityBefore = (await contract.getJurorInfo(jurors[2].address)).stake;
-      await contract.finalizeJuryRound(duelId); // round tally; opens appeal window
+      await contract.finalizeJuryRound(duelId); // round tally; round 2 is final at MAX_ROUNDS-1=2 -> still opens appeal
       const minorityAfter = (await contract.getJurorInfo(jurors[2].address)).stake;
 
       // Minority slashed immediately on round finalization.
@@ -1074,26 +1197,188 @@ describe("PredictionDuel", function () {
       await time.increaseTo(Number(data2.appealDeadline) + 1);
       await contract.finalizeJuryRound(duelId);
 
-      // Fee pool = 0.01 ETH escalation + 0.02 ETH slash = 0.03 ETH -> split among 2 majority jurors.
-      const reward = ethers.parseEther("0.03") / 2n;
+      // Fee pool composition (carried into round 2):
+      //   round 1 escalation 0.01 + appeal 0.03 + round 2 minority slash 0.02 = 0.06 ETH
+      // Split among 2 majority jurors of round 2.
+      const reward = ethers.parseEther("0.06") / 2n;
       expect(await contract.pendingWithdrawals(jurors[0].address)).to.equal(reward);
       expect(await contract.pendingWithdrawals(jurors[1].address)).to.equal(reward);
     });
 
-    it("48. Should revert finalizeJuryRound before voting period ends", async function () {
+    it("48. Should revert finalizeJuryRound before reveal period ends", async function () {
       const { contract, duelId, jurors } = await loadFixture(panelReadyFixture);
-      await contract.connect(jurors[0]).juryVote(duelId, Outcome.YES);
+      await commitVote(contract, duelId, { juror: jurors[0], vote: Outcome.YES }, 0);
 
+      // During commit phase: not yet at reveal deadline.
       await expect(contract.finalizeJuryRound(duelId))
-        .to.be.revertedWithCustomError(contract, "VotingPeriodNotOver");
+        .to.be.revertedWithCustomError(contract, "RevealPeriodNotOver");
+
+      // Advance into reveal phase but before reveal deadline -> still not over.
+      const dd = await contract.getDisputeData(duelId);
+      await time.increaseTo(Number(dd.commitDeadline) + 60);
+      await expect(contract.finalizeJuryRound(duelId))
+        .to.be.revertedWithCustomError(contract, "RevealPeriodNotOver");
+    });
+
+    it("48b. InvalidReveal: wrong salt or wrong outcome cannot reveal", async function () {
+      const { contract, duelId, jurors } = await loadFixture(panelReadyFixture);
+      const salt = await commitVote(
+        contract,
+        duelId,
+        { juror: jurors[0], vote: Outcome.YES },
+        0,
+      );
+      const dd = await contract.getDisputeData(duelId);
+      await time.increaseTo(Number(dd.commitDeadline));
+
+      // Wrong outcome - hash will not match.
+      await expect(
+        contract.connect(jurors[0]).revealJuryVote(duelId, jurors[0].address, Outcome.NO, salt),
+      ).to.be.revertedWithCustomError(contract, "InvalidReveal");
+
+      // Wrong salt - hash will not match.
+      await expect(
+        contract.connect(jurors[0]).revealJuryVote(duelId, jurors[0].address, Outcome.YES, jurorSalt(99)),
+      ).to.be.revertedWithCustomError(contract, "InvalidReveal");
+
+      // Correct reveal still works after the failed attempts.
+      await contract
+        .connect(jurors[0])
+        .revealJuryVote(duelId, jurors[0].address, Outcome.YES, salt);
+      const state = await contract.getJurorCommitState(duelId, jurors[0].address);
+      expect(state.committed).to.equal(true);
+      expect(state.revealed).to.equal(true);
+      expect(state.vote).to.equal(Outcome.YES);
+    });
+
+    it("48c. AlreadyRevealed: a juror cannot reveal twice", async function () {
+      const { contract, duelId, jurors } = await loadFixture(panelReadyFixture);
+      const salt = await commitVote(
+        contract,
+        duelId,
+        { juror: jurors[0], vote: Outcome.YES },
+        0,
+      );
+      const dd = await contract.getDisputeData(duelId);
+      await time.increaseTo(Number(dd.commitDeadline));
+      await contract.connect(jurors[0]).revealJuryVote(duelId, jurors[0].address, Outcome.YES, salt);
+
+      await expect(
+        contract.connect(jurors[0]).revealJuryVote(duelId, jurors[0].address, Outcome.YES, salt),
+      ).to.be.revertedWithCustomError(contract, "AlreadyRevealed");
+    });
+
+    it("48d. Non-revealer is slashed alongside minority on finalization (round 2)", async function () {
+      const { contract, alice, bob, duelId, jurors } = await loadFixture(panelReadyR2Fixture);
+
+      // jurors[0] commits YES + reveals.
+      // jurors[1] commits YES + reveals.
+      // jurors[2] commits NO  but DOES NOT reveal.
+      const salt0 = await commitVote(contract, duelId, { juror: jurors[0], vote: Outcome.YES }, 0);
+      const salt1 = await commitVote(contract, duelId, { juror: jurors[1], vote: Outcome.YES }, 1);
+      await commitVote(contract, duelId, { juror: jurors[2], vote: Outcome.NO }, 2);
+
+      const dd = await contract.getDisputeData(duelId);
+      await time.increaseTo(Number(dd.commitDeadline));
+
+      await contract.connect(jurors[0]).revealJuryVote(duelId, jurors[0].address, Outcome.YES, salt0);
+      await contract.connect(jurors[1]).revealJuryVote(duelId, jurors[1].address, Outcome.YES, salt1);
+      // jurors[2] stays silent.
+
+      const before2 = (await contract.getJurorInfo(jurors[2].address)).stake;
+      await time.increaseTo(Number(dd.revealDeadline));
+
+      // Round 2 resolves YES. Non-revealer (jurors[2]) is slashed for SLASH_AMOUNT.
+      // Round 2 loser is bob (he bet NO).
+      await expect(contract.finalizeJuryRound(duelId))
+        .to.emit(contract, "JurorSlashed")
+        .withArgs(jurors[2].address, duelId, ethers.parseEther("0.02"))
+        .and.to.emit(contract, "RoundResolved")
+        .withArgs(duelId, 2, Outcome.YES, bob.address);
+
+      const after2 = (await contract.getJurorInfo(jurors[2].address)).stake;
+      expect(before2 - after2).to.equal(ethers.parseEther("0.02"));
+
+      // Honest jurors are NOT slashed.
+      const j0Info = await contract.getJurorInfo(jurors[0].address);
+      const j1Info = await contract.getJurorInfo(jurors[1].address);
+      expect(j0Info.lockedOnDispute).to.equal(0n);
+      expect(j1Info.lockedOnDispute).to.equal(0n);
+      void alice;
+    });
+
+    it("48e. Commit binding: a juror's hash cannot be replayed by a different address (round 2)", async function () {
+      const { contract, duelId, jurors } = await loadFixture(panelReadyR2Fixture);
+      const hashFromOne = await contract.computeVoteCommit(
+        duelId,
+        jurors[0].address,
+        Outcome.YES,
+        jurorSalt(0),
+      );
+      // jurors[1] tries to submit jurors[0]'s hash. The commit itself succeeds
+      // (commits are opaque at commit time) but reveal must fail because the
+      // hash includes the juror's address - the contract recomputes the hash
+      // from the (juror, vote, salt) reveal args and the juror in the commit
+      // map is jurors[1], not jurors[0].
+      await contract.connect(jurors[1]).commitJuryVote(duelId, hashFromOne);
+
+      const dd = await contract.getDisputeData(duelId);
+      await time.increaseTo(Number(dd.commitDeadline));
+
+      // Try to reveal as if jurors[1] had committed for themselves.
+      await expect(
+        contract.connect(jurors[1]).revealJuryVote(
+          duelId, jurors[1].address, Outcome.YES, jurorSalt(0),
+        ),
+      ).to.be.revertedWithCustomError(contract, "InvalidReveal");
+
+      // Even more: anyone trying to claim that jurors[1]'s commit was for
+      // jurors[0]'s vote also fails. Permissionless reveal does NOT allow
+      // injecting an unrelated commit's plaintext.
+      await expect(
+        contract.connect(jurors[0]).revealJuryVote(
+          duelId, jurors[1].address, Outcome.YES, jurorSalt(0),
+        ),
+      ).to.be.revertedWithCustomError(contract, "InvalidReveal");
+    });
+
+    it("48f. Permissionless reveal: a third party can reveal on a juror's behalf given (vote, salt)", async function () {
+      const { contract, duelId, jurors, charlie } = await loadFixture(panelReadyR2Fixture);
+
+      // jurors[0] commits YES. jurors[1] commits NO. jurors[2] commits YES.
+      const salt0 = await commitVote(contract, duelId, { juror: jurors[0], vote: Outcome.YES }, 0);
+      const salt1 = await commitVote(contract, duelId, { juror: jurors[1], vote: Outcome.NO  }, 1);
+      const salt2 = await commitVote(contract, duelId, { juror: jurors[2], vote: Outcome.YES }, 2);
+
+      const dd = await contract.getDisputeData(duelId);
+      await time.increaseTo(Number(dd.commitDeadline));
+
+      // charlie is NOT a juror on this panel. They reveal everyone's commit
+      // because they happen to know the salts (e.g. relayer / public bulletin).
+      // The contract accepts because the hash binds to (duelId, juror, vote,
+      // salt) and the recomputed hash matches the stored commit.
+      await expect(
+        contract.connect(charlie).revealJuryVote(duelId, jurors[0].address, Outcome.YES, salt0),
+      ).to.emit(contract, "JurorRevealed").withArgs(duelId, jurors[0].address, Outcome.YES);
+      await contract.connect(charlie).revealJuryVote(duelId, jurors[1].address, Outcome.NO,  salt1);
+      await contract.connect(charlie).revealJuryVote(duelId, jurors[2].address, Outcome.YES, salt2);
+
+      // All three jurors are recorded as revealed even though none of them
+      // sent a reveal tx themselves. This is the single-tx-per-juror UX.
+      for (let i = 0; i < 3; i++) {
+        const s = await contract.getJurorCommitState(duelId, jurors[i].address);
+        expect(s.committed).to.equal(true);
+        expect(s.revealed).to.equal(true);
+      }
     });
   });
 
   describe("Phase 5: Appeal", function () {
     // Fixture: round 1 resolved with bob as round loser, appeal window open.
+    // Round 1 has 1 juror (panel size for round 1).
     async function afterRound1Fixture() {
       const signers = await ethers.getSigners();
-      const jurors = signers.slice(4, 7);
+      const jurors = [signers[4]]; // round 1 = 1 juror
       const base = await disputedDuelFixture();
       const { contract, alice, duelId } = base;
 
@@ -1101,12 +1386,10 @@ describe("PredictionDuel", function () {
       for (const j of jurors) await contract.connect(j).stakeAsJuror({ value: ethers.parseEther("0.1") });
       for (const j of jurors) await contract.connect(j).claimDispute();
 
-      await contract.connect(jurors[0]).juryVote(duelId, Outcome.YES);
-      await contract.connect(jurors[1]).juryVote(duelId, Outcome.YES);
-      await contract.connect(jurors[2]).juryVote(duelId, Outcome.NO);
+      await castJuryPanel(contract, duelId, [{ juror: jurors[0], vote: Outcome.YES }]);
 
       const data = await contract.getDisputeData(duelId);
-      await time.increaseTo(Number(data.votingDeadline));
+      await time.increaseTo(Number(data.revealDeadline));
       await contract.finalizeJuryRound(duelId); // opens appeal window; bob is round1Loser
 
       return { ...base, jurors };
@@ -1157,8 +1440,8 @@ describe("PredictionDuel", function () {
 
     it("53. Full 3-round escalation: round 3 verdict is final (no further appeal)", async function () {
       const signers = await ethers.getSigners();
-      // Need 3+5+7 = 15 jurors; use indices 4..18
-      const allJurors = signers.slice(4, 19);
+      // Panel sizes: 1 + 3 + 5 = 9 jurors; use indices 4..12.
+      const allJurors = signers.slice(4, 13);
 
       const base = await disputedDuelFixture();
       const { contract, alice, bob, duelId } = base;
@@ -1167,14 +1450,18 @@ describe("PredictionDuel", function () {
 
       async function runRound(_round: number, jurorSlice: typeof allJurors, majority: number) {
         for (const j of jurorSlice) await contract.connect(j).claimDispute();
-        for (let i = 0; i < jurorSlice.length; i++) {
-          await contract.connect(jurorSlice[i]).juryVote(
-            duelId,
-            i === jurorSlice.length - 1 ? (majority === Outcome.YES ? Outcome.NO : Outcome.YES) : majority,
-          );
-        }
+        // For panels >= 3 we put one minority voter to also exercise slashing.
+        // For 1-juror panel (round 1) the sole juror is the "majority".
+        const voters: Voter[] = jurorSlice.map((j, i) => ({
+          juror: j,
+          vote:
+            jurorSlice.length > 1 && i === jurorSlice.length - 1
+              ? majority === Outcome.YES ? Outcome.NO : Outcome.YES
+              : majority,
+        }));
+        await castJuryPanel(contract, duelId, voters);
         const d = await contract.getDisputeData(duelId);
-        await time.increaseTo(Number(d.votingDeadline));
+        await time.increaseTo(Number(d.revealDeadline));
         await contract.finalizeJuryRound(duelId);
       }
 
@@ -1183,18 +1470,15 @@ describe("PredictionDuel", function () {
         await contract.connect(j).stakeAsJuror({ value: ethers.parseEther("0.1") });
       }
 
-      // Escalate (round 1)
+      // Escalate (round 1, panel size = 1)
       await contract.connect(alice).escalateToJury(duelId, { value: DISPUTE_FEE });
-      // Round 1: YES majority, bob loses
-      await runRound(1, allJurors.slice(0, 3), Outcome.YES);
-      // Bob appeals to round 2
+      await runRound(1, allJurors.slice(0, 1), Outcome.YES); // 1 juror -> YES majority, bob loses
+      // Bob appeals to round 2 (panel size = 3)
       await contract.connect(bob).appealDispute(duelId, { value: 3n * DISPUTE_FEE });
-      // Round 2: YES majority again, bob loses
-      await runRound(2, allJurors.slice(3, 8), Outcome.YES);
-      // Bob appeals to round 3
+      await runRound(2, allJurors.slice(1, 4), Outcome.YES); // 2-1 YES majority
+      // Bob appeals to round 3 (panel size = 5)
       await contract.connect(bob).appealDispute(duelId, { value: 9n * DISPUTE_FEE });
-      // Round 3: YES majority - final
-      await runRound(3, allJurors.slice(8, 15), Outcome.YES);
+      await runRound(3, allJurors.slice(4, 9), Outcome.YES); // 4-1 YES majority - final
 
       const finalized = await contract.getDisputeData(duelId);
       expect(finalized.finalized).to.equal(true);
@@ -1221,70 +1505,84 @@ describe("PredictionDuel", function () {
     });
 
     it("E2. Should revert createDuel with NONE / INVALID creator outcome, empty question, bad deadlines", async function () {
-      const { contract, alice, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
+      const { contract, alice, votingStart, voteDeadline, resolutionDeadline, creatorStake, opponentStake } =
         await loadFixture(deployFixture);
 
       // NONE outcome
       await expect(
         contract.connect(alice).createDuel(
-          QUESTION, Outcome.NONE, opponentStake, NO_REP_GATE,
-          voteDeadline, resolutionDeadline, { value: creatorStake },
+          QUESTION, DESCRIPTION, Outcome.NONE, opponentStake, NO_REP_GATE,
+          votingStart, voteDeadline, resolutionDeadline, { value: creatorStake },
         ),
       ).to.be.revertedWithCustomError(contract, "InvalidOutcome");
 
       // INVALID outcome
       await expect(
         contract.connect(alice).createDuel(
-          QUESTION, Outcome.INVALID, opponentStake, NO_REP_GATE,
-          voteDeadline, resolutionDeadline, { value: creatorStake },
+          QUESTION, DESCRIPTION, Outcome.INVALID, opponentStake, NO_REP_GATE,
+          votingStart, voteDeadline, resolutionDeadline, { value: creatorStake },
         ),
       ).to.be.revertedWithCustomError(contract, "InvalidOutcome");
 
-      // Empty question
+      // Empty question (description may be empty, that's fine)
       await expect(
         contract.connect(alice).createDuel(
-          "", Outcome.YES, opponentStake, NO_REP_GATE,
-          voteDeadline, resolutionDeadline, { value: creatorStake },
+          "", DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE,
+          votingStart, voteDeadline, resolutionDeadline, { value: creatorStake },
         ),
       ).to.be.revertedWithCustomError(contract, "EmptyQuestion");
 
-      // voteDeadline in the past
+      // votingStart in the past
       const past = (await time.latest()) - 10;
       await expect(
         contract.connect(alice).createDuel(
-          QUESTION, Outcome.YES, opponentStake, NO_REP_GATE,
-          past, resolutionDeadline, { value: creatorStake },
+          QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE,
+          past, voteDeadline, resolutionDeadline, { value: creatorStake },
+        ),
+      ).to.be.revertedWithCustomError(contract, "InvalidDeadlines");
+
+      // voteDeadline <= votingStart
+      await expect(
+        contract.connect(alice).createDuel(
+          QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE,
+          votingStart, votingStart, resolutionDeadline, { value: creatorStake },
         ),
       ).to.be.revertedWithCustomError(contract, "InvalidDeadlines");
 
       // resolutionDeadline <= voteDeadline
       await expect(
         contract.connect(alice).createDuel(
-          QUESTION, Outcome.YES, opponentStake, NO_REP_GATE,
-          voteDeadline, voteDeadline, { value: creatorStake },
+          QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE,
+          votingStart, voteDeadline, voteDeadline, { value: creatorStake },
         ),
       ).to.be.revertedWithCustomError(contract, "InvalidDeadlines");
+
+      // Empty description is allowed (sanity check; no revert).
+      await expect(
+        contract.connect(alice).createDuel(
+          QUESTION, "", Outcome.YES, opponentStake, NO_REP_GATE,
+          votingStart, voteDeadline, resolutionDeadline, { value: creatorStake },
+        ),
+      ).to.emit(contract, "DuelCreated");
     });
 
-    it("E3. Should revert acceptDuel on missing duel and after voteDeadline", async function () {
-      const { contract, bob, opponentStake, voteDeadline } = await loadFixture(activeDuelFixture);
+    it("E3. Should revert acceptDuel on missing duel and after votingStart", async function () {
+      const { contract, bob, opponentStake } = await loadFixture(activeDuelFixture);
 
       await expect(
         contract.connect(bob).acceptDuel(99, { value: opponentStake }),
       ).to.be.revertedWithCustomError(contract, "DuelNotFound");
 
-      // Existing duel #1 was accepted in fixture; new duel for the deadline test.
-      // Move time past voteDeadline and try to accept the still-CREATED duel via a fresh setup.
+      // Fresh fixture: create a duel, advance past votingStart, try to accept.
       const f = await loadFixture(deployFixture);
       await f.contract.connect(f.alice).createDuel(
-        QUESTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
-        f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
+        QUESTION, DESCRIPTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
+        f.votingStart, f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
       );
-      await time.increaseTo(f.voteDeadline);
+      await time.increaseTo(f.votingStart);
       await expect(
         f.contract.connect(f.bob).acceptDuel(1, { value: f.opponentStake }),
-      ).to.be.revertedWithCustomError(f.contract, "VotingClosed");
-      void voteDeadline;
+      ).to.be.revertedWithCustomError(f.contract, "AcceptanceWindowClosed");
     });
 
     it("E4. Should revert submitVote with NONE outcome and on missing duel", async function () {
@@ -1313,12 +1611,12 @@ describe("PredictionDuel", function () {
     });
 
     it("E7. Should revert cancelDuel by non-creator", async function () {
-      const { contract, bob, voteDeadline, resolutionDeadline, creatorStake, opponentStake, alice } =
+      const { contract, bob, votingStart, voteDeadline, resolutionDeadline, creatorStake, opponentStake, alice } =
         await loadFixture(deployFixture);
 
       await contract.connect(alice).createDuel(
-        QUESTION, Outcome.YES, opponentStake, NO_REP_GATE,
-        voteDeadline, resolutionDeadline, { value: creatorStake },
+        QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE,
+        votingStart, voteDeadline, resolutionDeadline, { value: creatorStake },
       );
       await expect(contract.connect(bob).cancelDuel(1))
         .to.be.revertedWithCustomError(contract, "OnlyCreator");
@@ -1375,73 +1673,101 @@ describe("PredictionDuel", function () {
       await expect(contract.getNextDispute())
         .to.be.revertedWithCustomError(contract, "NoDisputesInQueue");
 
-      // Set up a disputed duel and escalate so the queue has one entry.
-      await contract.connect(f.alice).createDuel(
-        QUESTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
-        f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
-      );
-      await contract.connect(f.bob).acceptDuel(1, { value: f.opponentStake });
-      await contract.connect(f.alice).submitVote(1, Outcome.YES);
-      await contract.connect(f.bob).submitVote(1, Outcome.NO);
-      await time.increaseTo(f.voteDeadline);
-      await contract.settleDuel(1);
-      await contract.connect(f.alice).escalateToJury(1, { value: ethers.parseEther("0.01") });
+      // Set up TWO disputed duels so the queue has two entries. We need that
+      // because round 1 has a 1-juror panel: claiming the first dispute
+      // advances the queue head past it. With a single duel queued, j1's
+      // second claim would fail with NoDisputesInQueue before the lock
+      // check fires; with two, j1 can claim duel #1, and a second claim
+      // attempt then hits JurorAlreadyLocked (lock check sits after the
+      // queue-empty check).
+      for (let i = 1; i <= 2; i++) {
+        await contract.connect(f.alice).createDuel(
+          QUESTION, DESCRIPTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
+          f.votingStart + i, f.voteDeadline + i, f.resolutionDeadline + i,
+          { value: f.creatorStake },
+        );
+        await contract.connect(f.bob).acceptDuel(i, { value: f.opponentStake });
+      }
+      await time.increaseTo(f.votingStart + 2);
+      for (let i = 1; i <= 2; i++) {
+        await contract.connect(f.alice).submitVote(i, Outcome.YES);
+        await contract.connect(f.bob).submitVote(i, Outcome.NO);
+      }
+      await time.increaseTo(f.voteDeadline + 2);
+      for (let i = 1; i <= 2; i++) {
+        await contract.settleDuel(i);
+        await contract.connect(f.alice).escalateToJury(i, { value: ethers.parseEther("0.01") });
+      }
 
       // Ineligible juror (no stake)
       await expect(contract.connect(j1).claimDispute())
         .to.be.revertedWithCustomError(contract, "NotEligibleJuror");
 
-      // Stake j1, claim once, then second claim should hit JurorAlreadyLocked
+      // Stake j1, claim duel #1 (panel of 1, queue advances). Second claim
+      // would target duel #2 but j1 is locked.
       await contract.connect(j1).stakeAsJuror({ value: ethers.parseEther("0.1") });
       await contract.connect(j1).claimDispute();
       await expect(contract.connect(j1).claimDispute())
         .to.be.revertedWithCustomError(contract, "JurorAlreadyLocked");
 
-      // j2 stakes and would be a fresh juror; verify panel-membership uniqueness
-      // is enforced via the AlreadyJurorOnDispute branch. (Already covered by j1
-      // case above for the lock check; this case adds the second-juror happy path.)
+      // j2 is fresh; can claim the second dispute.
       await contract.connect(j2).stakeAsJuror({ value: ethers.parseEther("0.1") });
       await contract.connect(j2).claimDispute();
     });
 
-    it("E12. juryVote: revert NONE, before voting open, after voting closes", async function () {
+    it("E12. commit/reveal: revert before commit open, after commit closes, NotCommitted on reveal", async function () {
       const f = await loadFixture(deployFixture);
       const { contract } = f;
 
       // Build a disputed + escalated duel
       await contract.connect(f.alice).createDuel(
-        QUESTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
-        f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
+        QUESTION, DESCRIPTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
+        f.votingStart, f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
       );
       await contract.connect(f.bob).acceptDuel(1, { value: f.opponentStake });
+      await time.increaseTo(f.votingStart);
       await contract.connect(f.alice).submitVote(1, Outcome.YES);
       await contract.connect(f.bob).submitVote(1, Outcome.NO);
       await time.increaseTo(f.voteDeadline);
       await contract.settleDuel(1);
       await contract.connect(f.alice).escalateToJury(1, { value: ethers.parseEther("0.01") });
 
-      const [, , , , j1, j2, j3] = await ethers.getSigners();
-      // NONE vote: voting hasn't started - VotingNotStarted reverts first because
-      // the function checks NONE before votingDeadline. Use YES to test ordering.
-      await expect(contract.connect(j1).juryVote(1, Outcome.NONE))
-        .to.be.revertedWithCustomError(contract, "InvalidOutcome");
-      await expect(contract.connect(j1).juryVote(1, Outcome.YES))
+      const [, , , , j1] = await ethers.getSigners();
+      const dummyHash = await contract.computeVoteCommit(1, j1.address, Outcome.YES, jurorSalt(0));
+      // Before panel is full, commit phase has not started.
+      await expect(contract.connect(j1).commitJuryVote(1, dummyHash))
         .to.be.revertedWithCustomError(contract, "VotingNotStarted");
+      // Reveal NONE always reverts on InvalidOutcome (checked before phase).
+      await expect(
+        contract.connect(j1).revealJuryVote(1, j1.address, Outcome.NONE, jurorSalt(0)),
+      ).to.be.revertedWithCustomError(contract, "InvalidOutcome");
 
-      // Assemble the panel
-      for (const j of [j1, j2, j3]) {
-        await contract.connect(j).stakeAsJuror({ value: ethers.parseEther("0.1") });
-      }
-      for (const j of [j1, j2, j3]) {
-        await contract.connect(j).claimDispute();
-      }
+      // Assemble the (1-juror, round 1) panel.
+      await contract.connect(j1).stakeAsJuror({ value: ethers.parseEther("0.1") });
+      await contract.connect(j1).claimDispute();
 
-      // Now voting is open. Advance past it without voting.
+      // Reveal before commit phase ends -> RevealNotStarted.
+      await expect(
+        contract.connect(j1).revealJuryVote(1, j1.address, Outcome.YES, jurorSalt(0)),
+      ).to.be.revertedWithCustomError(contract, "RevealNotStarted");
+
+      // Advance past commit deadline without committing.
       const data = await contract.getDisputeData(1);
-      await time.increaseTo(Number(data.votingDeadline));
+      await time.increaseTo(Number(data.commitDeadline));
 
-      await expect(contract.connect(j1).juryVote(1, Outcome.YES))
-        .to.be.revertedWithCustomError(contract, "VotingClosed");
+      // Commit is now closed.
+      await expect(contract.connect(j1).commitJuryVote(1, dummyHash))
+        .to.be.revertedWithCustomError(contract, "CommitClosed");
+      // Reveal without commit -> NotCommitted.
+      await expect(
+        contract.connect(j1).revealJuryVote(1, j1.address, Outcome.YES, jurorSalt(0)),
+      ).to.be.revertedWithCustomError(contract, "NotCommitted");
+
+      // Advance past reveal deadline.
+      await time.increaseTo(Number(data.revealDeadline));
+      await expect(
+        contract.connect(j1).revealJuryVote(1, j1.address, Outcome.YES, jurorSalt(0)),
+      ).to.be.revertedWithCustomError(contract, "RevealClosed");
     });
 
     it("E13. finalizeJuryRound: revert when not initialized", async function () {
@@ -1450,47 +1776,62 @@ describe("PredictionDuel", function () {
         .to.be.revertedWithCustomError(contract, "DisputeNotInitialized");
     });
 
-    it("E14. Tie among 3 jurors -> INVALID verdict refunds both parties", async function () {
+    it("E14. Tie among 3 jurors in round 2 -> INVALID verdict refunds both parties", async function () {
+      // Tie semantics need >= 3 jurors; round 1 is a single juror, so we run
+      // this in round 2 (3-juror panel) by going through a round-1 verdict
+      // and an appeal first.
       const f = await loadFixture(deployFixture);
-      const { contract } = f;
+      const { contract, alice, bob, creatorStake, opponentStake } = f;
 
-      await contract.connect(f.alice).createDuel(
-        QUESTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
-        f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
+      // Set up DISPUTED duel.
+      await contract.connect(alice).createDuel(
+        QUESTION, DESCRIPTION, Outcome.YES, opponentStake, NO_REP_GATE,
+        f.votingStart, f.voteDeadline, f.resolutionDeadline, { value: creatorStake },
       );
-      await contract.connect(f.bob).acceptDuel(1, { value: f.opponentStake });
-      await contract.connect(f.alice).submitVote(1, Outcome.YES);
-      await contract.connect(f.bob).submitVote(1, Outcome.NO);
+      await contract.connect(bob).acceptDuel(1, { value: opponentStake });
+      await time.increaseTo(f.votingStart);
+      await contract.connect(alice).submitVote(1, Outcome.YES);
+      await contract.connect(bob).submitVote(1, Outcome.NO);
       await time.increaseTo(f.voteDeadline);
       await contract.settleDuel(1);
-      await contract.connect(f.alice).escalateToJury(1, { value: ethers.parseEther("0.01") });
 
-      const [, , , , j1, j2, j3] = await ethers.getSigners();
-      for (const j of [j1, j2, j3]) {
-        await contract.connect(j).stakeAsJuror({ value: ethers.parseEther("0.1") });
-      }
-      for (const j of [j1, j2, j3]) {
-        await contract.connect(j).claimDispute();
-      }
-      // 1 YES, 1 NO, 1 INVALID -> no YES/NO majority -> INVALID via tie path.
-      await contract.connect(j1).juryVote(1, Outcome.YES);
-      await contract.connect(j2).juryVote(1, Outcome.NO);
-      await contract.connect(j3).juryVote(1, Outcome.INVALID);
+      // Round 1: 1 juror votes YES so bob is round1Loser; bob appeals.
+      await contract.connect(alice).escalateToJury(1, { value: ethers.parseEther("0.01") });
+      const signers = await ethers.getSigners();
+      const r1 = signers[4];
+      await contract.connect(r1).stakeAsJuror({ value: ethers.parseEther("0.1") });
+      await contract.connect(r1).claimDispute();
+      await castJuryPanel(contract, 1n, [{ juror: r1, vote: Outcome.YES }]);
+      let data = await contract.getDisputeData(1);
+      await time.increaseTo(Number(data.revealDeadline));
+      await contract.finalizeJuryRound(1);
+      await contract.connect(bob).appealDispute(1, { value: ethers.parseEther("0.03") });
 
-      const data = await contract.getDisputeData(1);
-      await time.increaseTo(Number(data.votingDeadline));
+      // Round 2: 3 fresh jurors with a tied vote (1 YES, 1 NO, 1 INVALID).
+      const r2 = [signers[5], signers[6], signers[7]];
+      for (const j of r2) await contract.connect(j).stakeAsJuror({ value: ethers.parseEther("0.1") });
+      for (const j of r2) await contract.connect(j).claimDispute();
+      await castJuryPanel(contract, 1n, [
+        { juror: r2[0], vote: Outcome.YES },
+        { juror: r2[1], vote: Outcome.NO },
+        { juror: r2[2], vote: Outcome.INVALID },
+      ]);
+      data = await contract.getDisputeData(1);
+      await time.increaseTo(Number(data.revealDeadline));
 
       // INVALID verdict goes straight to _finalizeDispute, no appeal window.
       await expect(contract.finalizeJuryRound(1))
         .to.emit(contract, "DisputeFinalized").withArgs(1n, Outcome.INVALID)
-        .and.to.emit(contract, "DuelRefunded").withArgs(1n, f.creatorStake, f.opponentStake);
+        .and.to.emit(contract, "DuelRefunded").withArgs(1n, creatorStake, opponentStake);
 
-      // Fee pool on INVALID is split 50/50: 0.01 escalation + 2 x 0.02 minority slashes = 0.05 ETH.
-      // (j1 voted YES and j2 voted NO; j3 voted INVALID - only j3 matched the
-      // verdict, so j1 and j2 are minority and each lose SLASH_AMOUNT.)
-      const half = ethers.parseEther("0.025");
-      expect(await contract.pendingWithdrawals(f.alice.address)).to.equal(f.creatorStake + half);
-      expect(await contract.pendingWithdrawals(f.bob.address)).to.equal(f.opponentStake + half);
+      // Fee pool on INVALID is split 50/50:
+      //   round 1 escalation 0.01 + appeal fee 0.03
+      // + 2 x 0.02 minority slashes in round 2 (r2[0] voted YES, r2[1] NO;
+      //   both differ from verdict INVALID) = 0.04
+      // total = 0.08 ETH; each side gets 0.04 plus their original stake.
+      const half = ethers.parseEther("0.04");
+      expect(await contract.pendingWithdrawals(alice.address)).to.equal(creatorStake + half);
+      expect(await contract.pendingWithdrawals(bob.address)).to.equal(opponentStake + half);
     });
 
     it("E15. appealDispute: NoAppealWindow / AppealWindowExpired branches", async function () {
@@ -1506,30 +1847,26 @@ describe("PredictionDuel", function () {
       const { contract } = f;
 
       await contract.connect(f.alice).createDuel(
-        QUESTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
-        f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
+        QUESTION, DESCRIPTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
+        f.votingStart, f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
       );
       await contract.connect(f.bob).acceptDuel(1, { value: f.opponentStake });
+      await time.increaseTo(f.votingStart);
       await contract.connect(f.alice).submitVote(1, Outcome.YES);
       await contract.connect(f.bob).submitVote(1, Outcome.NO);
       await time.increaseTo(f.voteDeadline);
       await contract.settleDuel(1);
       await contract.connect(f.alice).escalateToJury(1, { value: ethers.parseEther("0.01") });
 
-      const [, , , , j1, j2, j3] = await ethers.getSigners();
-      for (const j of [j1, j2, j3]) {
-        await contract.connect(j).stakeAsJuror({ value: ethers.parseEther("0.1") });
-      }
-      for (const j of [j1, j2, j3]) {
-        await contract.connect(j).claimDispute();
-      }
-      // Majority NO: alice (creator, bet YES) is round1Loser
-      await contract.connect(j1).juryVote(1, Outcome.NO);
-      await contract.connect(j2).juryVote(1, Outcome.NO);
-      await contract.connect(j3).juryVote(1, Outcome.YES);
+      // Round 1 has a 1-juror panel. The juror votes NO -> NO majority ->
+      // alice (bet YES) is round1Loser.
+      const [, , , , j1] = await ethers.getSigners();
+      await contract.connect(j1).stakeAsJuror({ value: ethers.parseEther("0.1") });
+      await contract.connect(j1).claimDispute();
+      await castJuryPanel(contract, 1n, [{ juror: j1, vote: Outcome.NO }]);
 
       const data = await contract.getDisputeData(1);
-      await time.increaseTo(Number(data.votingDeadline));
+      await time.increaseTo(Number(data.revealDeadline));
       await contract.finalizeJuryRound(1);
 
       const dd = await contract.getDisputeData(1);
@@ -1542,10 +1879,11 @@ describe("PredictionDuel", function () {
       const { contract } = f;
 
       await contract.connect(f.alice).createDuel(
-        QUESTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
-        f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
+        QUESTION, DESCRIPTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
+        f.votingStart, f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
       );
       await contract.connect(f.bob).acceptDuel(1, { value: f.opponentStake });
+      await time.increaseTo(f.votingStart);
       await contract.connect(f.alice).submitVote(1, Outcome.YES);
       await contract.connect(f.bob).submitVote(1, Outcome.NO);
       await time.increaseTo(f.voteDeadline);
@@ -1576,14 +1914,15 @@ describe("PredictionDuel", function () {
 
       // Wrong status (CREATED, never accepted/disputed)
       await contract.connect(f.alice).createDuel(
-        QUESTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
-        f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
+        QUESTION, DESCRIPTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
+        f.votingStart, f.voteDeadline, f.resolutionDeadline, { value: f.creatorStake },
       );
       await expect(contract.cancelStaleDispute(1))
         .to.be.revertedWithCustomError(contract, "DuelNotDisputed");
 
       // After escalation: should revert with DisputeAlreadyInitialized
       await contract.connect(f.bob).acceptDuel(1, { value: f.opponentStake });
+      await time.increaseTo(f.votingStart);
       await contract.connect(f.alice).submitVote(1, Outcome.YES);
       await contract.connect(f.bob).submitVote(1, Outcome.NO);
       await time.increaseTo(f.voteDeadline);
@@ -1604,8 +1943,9 @@ describe("PredictionDuel", function () {
       // Create three duels, settle one
       for (let i = 0; i < 3; i++) {
         await contract.connect(f.alice).createDuel(
-          QUESTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
-          f.voteDeadline + i, f.resolutionDeadline + i, { value: f.creatorStake },
+          QUESTION, DESCRIPTION, Outcome.YES, f.opponentStake, NO_REP_GATE,
+          f.votingStart + i, f.voteDeadline + i, f.resolutionDeadline + i,
+          { value: f.creatorStake },
         );
       }
 

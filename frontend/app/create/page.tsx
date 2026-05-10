@@ -61,6 +61,9 @@ function CreateForm() {
   const [question, setQuestion] = useState(
     "Will ETH close above $4,000 on Dec 31, 2026?",
   );
+  const [description, setDescription] = useState(
+    "Resolves YES if the ETH/USD spot price on Coinbase at 23:59 UTC on Dec 31, 2026 is strictly greater than $4,000.",
+  );
   const [outcome, setOutcome] = useState<keyof typeof Outcomes>("YES");
 
   // Stakes are stored canonically in ETH (as numbers) and rendered in the
@@ -72,11 +75,18 @@ function CreateForm() {
   const [ratio, setRatio] = useState(1);
 
   const [minRep, setMinRep] = useState("0");
-  const [voteDeadline, setVoteDeadline] = useState(
+  // Three timestamps gate the duel:
+  //   votingStart        - voting opens (acceptance must close before here)
+  //   voteDeadline       - voting closes; settle becomes callable after
+  //   resolutionDeadline - no-show paths kick in if nobody settled
+  const [votingStart, setVotingStart] = useState(
     localDatetimeFromOffset(60 * 60),
   );
-  const [resolutionDeadline, setResolutionDeadline] = useState(
+  const [voteDeadline, setVoteDeadline] = useState(
     localDatetimeFromOffset(2 * 60 * 60),
+  );
+  const [resolutionDeadline, setResolutionDeadline] = useState(
+    localDatetimeFromOffset(3 * 60 * 60),
   );
 
   // Display values (strings shown in the inputs, in the current unit).
@@ -193,13 +203,15 @@ function CreateForm() {
     if (!question.trim()) return "Question is required";
     if (creatorEth <= 0) return "Your stake must be > 0";
     if (opponentEth <= 0) return "Opponent stake must be > 0";
+    const vs = epochFromLocal(votingStart);
     const vd = epochFromLocal(voteDeadline);
     const rd = epochFromLocal(resolutionDeadline);
     const now = BigInt(Math.floor(Date.now() / 1000));
-    if (vd <= now) return "Vote deadline must be in the future";
+    if (vs <= now) return "Voting-start time must be in the future";
+    if (vd <= vs) return "Vote deadline must be after voting starts";
     if (rd <= vd) return "Resolution deadline must be after vote deadline";
     return null;
-  }, [question, creatorEth, opponentEth, voteDeadline, resolutionDeadline]);
+  }, [question, creatorEth, opponentEth, votingStart, voteDeadline, resolutionDeadline]);
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -213,9 +225,11 @@ function CreateForm() {
         functionName: "createDuel",
         args: [
           question.trim(),
+          description.trim(),
           Outcomes[outcome],
           parseEther(toEthString(opponentEth)),
           BigInt(minRep || "0"),
+          epochFromLocal(votingStart),
           epochFromLocal(voteDeadline),
           epochFromLocal(resolutionDeadline),
         ],
@@ -244,13 +258,26 @@ function CreateForm() {
       </CardHeader>
       <CardContent>
         <form className="space-y-4" onSubmit={submit}>
-          <Field label="Question">
+          <Field label="Question (title)">
             <Textarea
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               placeholder="A clear yes/no question with a verifiable answer"
               rows={2}
             />
+          </Field>
+
+          <Field label="Description (optional)">
+            <Textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Resolution rules, source URL, what counts as YES vs NO, edge cases. Plain text."
+              rows={3}
+            />
+            <p className="text-xs text-muted-foreground">
+              Stored on-chain alongside the title. Use it to make resolution
+              unambiguous (e.g. exact source, timestamp, tie-break rule).
+            </p>
           </Field>
 
           <Field label="Your prediction">
@@ -366,7 +393,14 @@ function CreateForm() {
             </div>
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-4 sm:grid-cols-3">
+            <Field label="Voting opens">
+              <Input
+                type="datetime-local"
+                value={votingStart}
+                onChange={(e) => setVotingStart(e.target.value)}
+              />
+            </Field>
             <Field label="Vote deadline">
               <Input
                 type="datetime-local"
@@ -383,9 +417,15 @@ function CreateForm() {
             </Field>
           </div>
           <p className="text-xs text-muted-foreground">
-            Both parties must vote before the vote deadline. After the
-            resolution deadline, no-show paths kick in (refund or solo-voter
-            wins, plus a no-show reputation penalty).
+            <strong>Voting opens</strong> = the moment the event has happened
+            and answers are knowable. The opponent must <em>accept before this
+            time</em> so they cannot join after seeing the result. Set it just
+            after the event resolves (e.g. event on Dec 1, voting opens Dec 2).
+            <br />
+            <strong>Vote deadline</strong> = voting closes; either side can
+            then settle. After the <strong>resolution deadline</strong>,
+            no-show paths kick in (refund or solo-voter wins, plus a no-show
+            reputation penalty).
           </p>
 
           <Field label="Min opponent reputation (optional)">
