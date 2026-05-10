@@ -1,7 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { useReadContract, useWriteContract } from "wagmi";
+import { useAccount, useReadContract, useWriteContract } from "wagmi";
+import { toast } from "sonner";
+
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -9,7 +11,8 @@ import { Badge } from "@/components/ui/badge";
 import { ChainGuard } from "@/components/chain-guard";
 import { useTxToast } from "@/components/tx-status";
 import { predictionDuel } from "@/lib/contracts";
-import { fmtDeadline, timeUntil } from "@/lib/format";
+import { fmtDeadline, explainError, outcomeLabel } from "@/lib/format";
+import { formatCountdown, useNow } from "@/lib/use-countdown";
 
 export default function JuryPage() {
   return (
@@ -30,7 +33,7 @@ export default function JuryPage() {
 }
 
 function NextDispute() {
-  const { data: queueLen } = useReadContract({
+  const { data: queueLen, refetch } = useReadContract({
     ...predictionDuel,
     functionName: "getDisputeQueueLength",
   });
@@ -40,7 +43,16 @@ function NextDispute() {
     hash,
     pendingMsg: "Claiming dispute…",
     successMsg: "Joined panel",
+    onSuccess: () => refetch(),
   });
+
+  const onClaim = () => {
+    try {
+      writeContract({ ...predictionDuel, functionName: "claimDispute" });
+    } catch (e) {
+      toast.error("Claim failed", { description: explainError(e) });
+    }
+  };
 
   return (
     <Card>
@@ -53,12 +65,7 @@ function NextDispute() {
             ? "No disputes are waiting for jurors right now."
             : `${len} dispute${len === 1n ? "" : "s"} waiting for jurors. Click claim to join the front of the queue.`}
         </p>
-        <Button
-          disabled={isPending || len === 0n}
-          onClick={() =>
-            writeContract({ ...predictionDuel, functionName: "claimDispute" })
-          }
-        >
+        <Button disabled={isPending || len === 0n} onClick={onClaim}>
           Claim next dispute
         </Button>
       </CardContent>
@@ -88,7 +95,7 @@ function ActiveDisputes() {
           </div>
         ) : ids.length === 0 ? (
           <p className="text-sm text-muted-foreground">
-            No initialised disputes. They appear here once someone calls
+            No initialised disputes. They appear here once someone calls{" "}
             <code className="mx-1 rounded bg-muted px-1 py-0.5 text-xs">
               escalateToJury
             </code>
@@ -107,14 +114,13 @@ function ActiveDisputes() {
 }
 
 function DisputeRow({ id, onChange }: { id: bigint; onChange: () => void }) {
+  const now = useNow();
+  const { address } = useAccount();
   const { data, refetch } = useReadContract({
     ...predictionDuel,
     functionName: "getDisputeData",
     args: [id],
   });
-  // tuple ordering matches Solidity returns:
-  // round, lastRoundOutcome, selectedJurors, votingDeadline,
-  // appealDeadline, round1Loser, round2Loser, feePool, initialized, finalized
   const dd = data as
     | readonly [
         number,
@@ -141,103 +147,140 @@ function DisputeRow({ id, onChange }: { id: bigint; onChange: () => void }) {
     },
   });
 
+  type AnyWriteArgs = Parameters<typeof writeContract>[0];
+  const send = (label: string, args: AnyWriteArgs | unknown) => {
+    try {
+      writeContract(args as AnyWriteArgs);
+    } catch (e) {
+      toast.error(`${label} failed`, { description: explainError(e) });
+    }
+  };
+
   if (!dd) return <Skeleton className="h-16" />;
 
-  const [round, , panel, votingDeadline, appealDeadline, , , , , finalized] = dd;
-  const now = Math.floor(Date.now() / 1000);
+  const [
+    round,
+    lastRoundOutcome,
+    panel,
+    votingDeadline,
+    appealDeadline,
+    ,
+    ,
+    feePool,
+    ,
+    finalized,
+  ] = dd;
   const inAppeal = appealDeadline !== 0n;
-  const votingOpen = votingDeadline !== 0n && now < Number(votingDeadline);
-  const votingExpired = votingDeadline !== 0n && now >= Number(votingDeadline);
-  const appealExpired = inAppeal && now > Number(appealDeadline);
+  const votingOpen = votingDeadline !== 0n && now / 1000 < Number(votingDeadline);
+  const votingExpired = votingDeadline !== 0n && now / 1000 >= Number(votingDeadline);
+  const appealExpired = inAppeal && now / 1000 > Number(appealDeadline);
+  const onPanel =
+    address && panel.some((p) => p.toLowerCase() === address.toLowerCase());
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-secondary/30 p-3 text-sm">
-      <div className="space-y-1">
-        <div className="flex items-center gap-2">
-          <Link
-            href={`/duels/${id}`}
-            className="font-medium text-foreground hover:text-primary"
-          >
-            Duel #{id.toString()}
-          </Link>
-          <Badge variant="primary">Round {round}</Badge>
-          {finalized && <Badge variant="success">Finalized</Badge>}
-          {inAppeal && !finalized && (
-            <Badge variant="warn">Appeal window</Badge>
+    <div className="space-y-2 rounded-md border border-border bg-secondary/30 p-3 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="space-y-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <Link
+              href={`/duels/${id}`}
+              className="font-medium text-foreground hover:text-primary"
+            >
+              Duel #{id.toString()}
+            </Link>
+            <Badge variant="primary">Round {round} / 3</Badge>
+            {finalized && <Badge variant="success">Finalized</Badge>}
+            {inAppeal && !finalized && <Badge variant="warn">Appeal window</Badge>}
+            {votingOpen && <Badge variant="warn">Voting open</Badge>}
+            {onPanel && <Badge variant="muted">You&apos;re on this panel</Badge>}
+          </div>
+          <div className="text-xs text-muted-foreground">
+            Panel {panel.length} juror{panel.length === 1 ? "" : "s"} - fee pool{" "}
+            <span className="font-mono">
+              {(Number(feePool) / 1e18).toFixed(3)} ETH
+            </span>
+            {votingDeadline !== 0n && (
+              <>
+                {" - voting "}
+                {votingOpen ? "ends" : "ended"}{" "}
+                {fmtDeadline(votingDeadline)} ({formatCountdown(votingDeadline, now)})
+              </>
+            )}
+            {inAppeal && (
+              <>
+                {" - appeal "}
+                {appealExpired ? "expired" : "ends"}{" "}
+                {fmtDeadline(appealDeadline)} ({formatCountdown(appealDeadline, now)})
+              </>
+            )}
+            {finalized && lastRoundOutcome !== 0 && (
+              <> - final verdict <strong>{outcomeLabel[lastRoundOutcome]}</strong></>
+            )}
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {votingOpen && onPanel && (
+            <>
+              <Button
+                size="sm"
+                variant="success"
+                disabled={isPending}
+                onClick={() =>
+                  send("Vote YES", {
+                    ...predictionDuel,
+                    functionName: "juryVote",
+                    args: [id, 1],
+                  })
+                }
+              >
+                Vote YES
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={isPending}
+                onClick={() =>
+                  send("Vote NO", {
+                    ...predictionDuel,
+                    functionName: "juryVote",
+                    args: [id, 2],
+                  })
+                }
+              >
+                Vote NO
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={isPending}
+                onClick={() =>
+                  send("Vote INVALID", {
+                    ...predictionDuel,
+                    functionName: "juryVote",
+                    args: [id, 3],
+                  })
+                }
+              >
+                INVALID
+              </Button>
+            </>
           )}
-          {votingOpen && <Badge variant="warn">Voting open</Badge>}
+          {(votingExpired || appealExpired) && !finalized && (
+            <Button
+              size="sm"
+              disabled={isPending}
+              onClick={() =>
+                send("Finalize", {
+                  ...predictionDuel,
+                  functionName: "finalizeJuryRound",
+                  args: [id],
+                })
+              }
+            >
+              Finalize round
+            </Button>
+          )}
         </div>
-        <div className="text-xs text-muted-foreground">
-          Panel {panel.length} juror{panel.length === 1 ? "" : "s"} ·{" "}
-          {votingDeadline !== 0n
-            ? `voting ${votingOpen ? "ends" : "ended"} ${fmtDeadline(votingDeadline)} (${timeUntil(votingDeadline)})`
-            : "panel still being assembled"}
-          {inAppeal &&
-            ` · appeal ${appealExpired ? "expired" : "ends"} ${fmtDeadline(appealDeadline)}`}
-        </div>
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {votingOpen && (
-          <>
-            <Button
-              size="sm"
-              variant="success"
-              disabled={isPending}
-              onClick={() =>
-                writeContract({
-                  ...predictionDuel,
-                  functionName: "juryVote",
-                  args: [id, 1],
-                })
-              }
-            >
-              Vote YES
-            </Button>
-            <Button
-              size="sm"
-              variant="secondary"
-              disabled={isPending}
-              onClick={() =>
-                writeContract({
-                  ...predictionDuel,
-                  functionName: "juryVote",
-                  args: [id, 2],
-                })
-              }
-            >
-              Vote NO
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={isPending}
-              onClick={() =>
-                writeContract({
-                  ...predictionDuel,
-                  functionName: "juryVote",
-                  args: [id, 3],
-                })
-              }
-            >
-              INVALID
-            </Button>
-          </>
-        )}
-        {(votingExpired || appealExpired) && !finalized && (
-          <Button
-            size="sm"
-            disabled={isPending}
-            onClick={() =>
-              writeContract({
-                ...predictionDuel,
-                functionName: "finalizeJuryRound",
-                args: [id],
-              })
-            }
-          >
-            Finalize round
-          </Button>
-        )}
       </div>
     </div>
   );

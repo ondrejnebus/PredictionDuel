@@ -208,7 +208,7 @@ describe("DuelReputation", function () {
     it("R16. Should scale penalty by score/5 when score is high", async function () {
       const { reputation, duelMock, alice } = await loadFixture(deployFixture);
       // Build alice's score above 50 so score/5 > 10 (the base penalty).
-      // Eight 1-ETH wins -> 8 × 11 = 88 win points, score = 88.
+      // Eight 1-ETH wins -> 8 x 11 = 88 win points, score = 88.
       const oneEth = ethers.parseEther("1");
       for (let i = 0; i < 8; i++) {
         await reputation.connect(duelMock).recordWin(alice.address, oneEth);

@@ -1112,7 +1112,7 @@ describe("PredictionDuel", function () {
       return { ...base, jurors };
     }
 
-    it("49. Round loser can appeal, escalating to round 2 with 3× fee", async function () {
+    it("49. Round loser can appeal, escalating to round 2 with 3x fee", async function () {
       const { contract, bob, duelId } = await loadFixture(afterRound1Fixture);
       const appealFee = ethers.parseEther("0.03");
 
@@ -1485,7 +1485,7 @@ describe("PredictionDuel", function () {
         .to.emit(contract, "DisputeFinalized").withArgs(1n, Outcome.INVALID)
         .and.to.emit(contract, "DuelRefunded").withArgs(1n, f.creatorStake, f.opponentStake);
 
-      // Fee pool on INVALID is split 50/50: 0.01 escalation + 2 × 0.02 minority slashes = 0.05 ETH.
+      // Fee pool on INVALID is split 50/50: 0.01 escalation + 2 x 0.02 minority slashes = 0.05 ETH.
       // (j1 voted YES and j2 voted NO; j3 voted INVALID - only j3 matched the
       // verdict, so j1 and j2 are minority and each lose SLASH_AMOUNT.)
       const half = ethers.parseEther("0.025");

@@ -20,7 +20,7 @@ import {DuelReputation} from "./DuelReputation.sol";
 ///         `claimDispute()`. Jurors vote in a `VOTING_PERIOD` window; the
 ///         majority verdict stands. Minority jurors lose `SLASH_AMOUNT`
 ///         (Schelling-point incentive). The round loser may appeal within
-///         `APPEAL_WINDOW`, escalating to a larger panel at 3× / 9× fee.
+///         `APPEAL_WINDOW`, escalating to a larger panel at 3x / 9x fee.
 ///         Maximum three rounds (3-juror -> 5-juror -> 7-juror). After the
 ///         final round the duel is settled on-chain and reputation updated.
 contract PredictionDuel is ReentrancyGuard {
@@ -566,7 +566,7 @@ contract PredictionDuel is ReentrancyGuard {
     }
 
     /// @notice The round loser appeals within the appeal window, escalating to
-    ///         the next jury tier. Fee: 3× DISPUTE_FEE for round 2, 9× for round 3.
+    ///         the next jury tier. Fee: 3x DISPUTE_FEE for round 2, 9x for round 3.
     function appealDispute(uint256 duelId) external payable nonReentrant {
         DisputeData storage dd = _disputes[duelId];
         if (dd.finalized)        revert DisputeAlreadyFinalized();
