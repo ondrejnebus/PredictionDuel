@@ -154,7 +154,7 @@ When `settleDuel` sees disagreeing votes the duel is parked in `DISPUTED`.
 | 2 | 3 | 3x (0.03 ETH) |
 | 3 | 5 | 9x (0.09 ETH) |
 
-Round 1 starts with a single arbiter — fast and cheap for clear-cut cases. The
+Round 1 starts with a single arbiter - fast and cheap for clear-cut cases. The
 panel grows by 2 (odd sizes prevent ties) only when the round loser pays the
 escalating appeal fee, so frivolous appeals self-fund honest jurors.
 
@@ -176,7 +176,7 @@ escalating appeal fee, so frivolous appeals self-fund honest jurors.
    on purpose: the hash binding to `(duelId, juror, vote, salt)` makes it
    impossible to frame a juror with a vote they did not commit, so the
    contract does not need to check `msg.sender`. This means a juror only has
-   to send a single wallet transaction (the commit) — the reveal can be
+   to send a single wallet transaction (the commit) - the reveal can be
    delivered by the juror returning to the site (auto-revealed by the
    frontend), by a relayer the juror posted `(vote, salt)` to, or by any
    third party who happens to know the salt.
@@ -222,7 +222,7 @@ Tailwind + sonner. Lives in [`frontend/`](frontend/).
 | `/duels` | Browse open and active duels. |
 | `/duels/[id]` | Duel detail - accept / vote / settle / **escalate / appeal**, full DisputeData (panel, fee pool, deadlines), live countdown. |
 | `/create` | Create a duel: title + long-form description, ETH ↔ USD stake toggle, stake-ratio presets, three datetime pickers (voting opens / vote deadline / resolution deadline). |
-| `/jury` | Stake as juror, see queue, claim disputes, **commit** votes (salt is generated client-side and stored in localStorage). When the reveal phase opens and the juror returns to the page, the frontend **auto-reveals** without a second click. Anyone else with the salt can also reveal — the contract is permissionless. Finalize round once the reveal phase ends. |
+| `/jury` | Stake as juror, see queue, claim disputes, **commit** votes (salt is generated client-side and stored in localStorage). When the reveal phase opens and the juror returns to the page, the frontend **auto-reveals** without a second click. Anyone else with the salt can also reveal - the contract is permissionless. Finalize round once the reveal phase ends. |
 | `/profile` | Reputation card, **soulbound NFT preview** (decoded from on-chain `tokenURI`), pending balance withdraw, **stake / unstake** as juror, my duels. |
 
 All write paths go through wagmi's `useWriteContract` + a `useTxToast` hook
@@ -461,14 +461,14 @@ specific combination is the contribution:
   the salt that lets *anyone* call reveal lives in the juror's
   `localStorage` until `revealJuryVote` consumes it. A juror who commits
   from a private window, then clears site data, then never returns, also
-  never reveals — and is slashed. The frontend auto-reveals on the next
+  never reveals - and is slashed. The frontend auto-reveals on the next
   visit during the reveal window so the common case is a single click; for
   set-and-forget UX the juror would need to post `(vote, salt)` to a public
   relayer (not implemented; `vercel.json` already supports a function route
   if we wanted one).
 * **Lock-up during a round.** Once a juror calls `claimDispute`, their
   stake is locked on that dispute (`lockedOnDispute`) until
-  `finalizeJuryRound` completes — typically 48h commit+reveal plus up to
+  `finalizeJuryRound` completes - typically 48h commit+reveal plus up to
   24h appeal window. This is intrinsic to stake-at-risk jury design (the
   stake must be slashable), not a quirk of commit-reveal: a single-tx vote
   scheme would lock the juror identically. A future improvement would let

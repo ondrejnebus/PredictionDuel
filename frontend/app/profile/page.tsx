@@ -110,7 +110,7 @@ function ReputationCard({ user }: { user: `0x${string}` }) {
 /// and render a small NFT preview. Soulbound NFTs are lazy-minted, so this
 /// gracefully shows "not minted yet" until the first record* event hits.
 function NftPreviewCard({ user }: { user: `0x${string}` }) {
-  // tokenId = uint256(uint160(addr)) — derive client-side to query metadata.
+  // tokenId = uint256(uint160(addr)) - derive client-side to query metadata.
   const tokenId = useMemo(() => BigInt(user), [user]);
   const { data, isLoading, error } = useReadContract({
     ...duelReputation,
@@ -345,7 +345,7 @@ function JurorCard({ user }: { user: `0x${string}` }) {
             href="/jury"
             className="text-sm text-primary underline-offset-4 hover:underline"
           >
-            Open jury page ->
+            Open jury page
           </Link>
         </div>
 
@@ -405,7 +405,7 @@ function JurorCard({ user }: { user: `0x${string}` }) {
               </Button>
               <p className="text-[11px] text-muted-foreground">
                 Unstaking below 0.05 ETH deactivates you as juror. Funds are
-                credited to your pending balance — claim via Withdraw above.
+                credited to your pending balance - claim via Withdraw above.
               </p>
             </div>
           )}

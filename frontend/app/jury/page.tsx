@@ -31,7 +31,7 @@ export default function JuryPage() {
         <p className="text-sm text-muted-foreground">
           Stake to become a juror, claim disputes from the FIFO queue, and
           submit a hidden commit. Reveal happens automatically when you visit
-          this page during the reveal window — no second click needed. (The
+          this page during the reveal window - no second click needed. (The
           contract&apos;s reveal is permissionless: another juror, a relayer,
           or anyone with your salt can also reveal on your behalf.) Vote with
           the majority or lose 0.02 ETH; skip the reveal and lose the same.
@@ -370,7 +370,7 @@ function CommitRevealPanel({
   // Auto-reveal: when the reveal phase is open, the juror has a stored
   // commit, hasn't revealed yet, and isn't already submitting another tx,
   // fire the reveal automatically. The user still signs the wallet popup,
-  // but they don't have to remember to click "Reveal" — opening the page is
+  // but they don't have to remember to click "Reveal" - opening the page is
   // enough. `revealJuryVote` is permissionless, so a relayer or another
   // juror could also have done this on their behalf.
   const autoTriggered = useRef(false);
@@ -396,12 +396,12 @@ function CommitRevealPanel({
       {inCommit && !hasCommitted && (
         <>
           <div className="text-xs font-medium uppercase tracking-wide text-amber-400">
-            Commit phase — pick a vote
+            Commit phase - pick a vote
           </div>
           <p className="text-xs text-muted-foreground">
             Your choice is hashed locally with a random salt; only the hash
             goes on-chain. The salt + outcome are saved in this browser so we
-            can reveal automatically when the reveal phase opens — you&apos;ll
+            can reveal automatically when the reveal phase opens - you&apos;ll
             see one wallet popup now and one when reveal time comes if you
             return to the page. If you commit from a private window or clear
             site data, you&apos;ll need to reveal manually from the original

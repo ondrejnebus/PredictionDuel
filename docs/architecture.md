@@ -100,7 +100,7 @@ Per-round timing:
 ```
 
 Key rules embedded in the diagram:
-- **Commit-reveal voting** — jurors submit
+- **Commit-reveal voting** - jurors submit
   `keccak256(abi.encode(duelId, juror, vote, salt))` during the commit phase;
   reveals are only accepted after the commit phase closes, so no juror can
   see another juror's vote before committing their own.
